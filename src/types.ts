@@ -26,6 +26,28 @@ export type ProviderConfig = {
   temperature: number
 }
 
+export type AsrProviderConfig = {
+  baseUrl: string
+  apiKey: string
+  model: string
+}
+
+export type AsrRuntimeStatus = {
+  llamaServerPath?: string
+  modelPath?: string
+  mmprojPath?: string
+  localServerUrl?: string
+  localReady: boolean
+}
+
+export type AsrTranscriptionResponse = {
+  text: string
+  providerLabel: string
+  usedFallback: boolean
+  warning?: string
+  localServerUrl?: string
+}
+
 export type SearchMode = 'auto' | 'confirm' | 'off'
 
 export type SearchConfig = {

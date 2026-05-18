@@ -30,9 +30,11 @@ export async function generateAgentDraft(params: {
 
   if (!params.provider.apiKey.trim() || !params.provider.baseUrl.trim() || !params.provider.model.trim()) {
     return {
-      ...fallback,
-      providerLabel: 'local deterministic draft',
-      error: '未配置 OpenAI-compatible provider，当前使用本地规则生成草案。',
+      answer: '还没有配置会议问答模型。请填写 Provider 的 Base URL、Model 和 API key 后再提问。',
+      planItems: [],
+      evidence: fallback.evidence,
+      providerLabel: 'provider not configured',
+      error: '未配置 OpenAI-compatible 文本模型，本次没有生成硬编码草稿。',
     }
   }
 
@@ -49,8 +51,10 @@ export async function generateAgentDraft(params: {
     }
   } catch (error) {
     return {
-      ...fallback,
-      providerLabel: 'local fallback after provider error',
+      answer: '会议问答模型调用失败。请检查 Provider 配置、网络或模型服务状态后重试。',
+      planItems: [],
+      evidence: fallback.evidence,
+      providerLabel: 'provider error',
       error: error instanceof Error ? error.message : 'Unknown provider error',
     }
   }

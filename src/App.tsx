@@ -27,10 +27,11 @@ import {
   Square,
   Trash2,
 } from 'lucide-react'
-import { demoLiveSegments, demoSegments } from './data/demoMeeting'
+import { demoLiveSegments } from './data/demoMeeting'
 import { formatClock, formatDuration, makeId } from './lib/time'
 import { loadJson, saveJson } from './lib/storage'
 import { probeMicrophone, probeSystemAudio } from './services/audioCapture'
+import { getAsrRuntimeStatus, transcribeAudioChunk } from './services/asrTranscription'
 import { buildRollingSummary } from './services/meetingMemory'
 import { generateAgentDraft } from './services/modelProvider'
 import { runAutoSearch } from './services/searchTool'
@@ -38,6 +39,9 @@ import { createSpeechSession, getSpeechRecognitionSupport } from './services/spe
 import type { SpeechSession } from './services/speechRecognition'
 import type {
   AgentResponse,
+  AsrProviderConfig,
+  AsrRuntimeStatus,
+  AsrTranscriptionResponse,
   AudioSource,
   CaptureProbe,
   MeetingMode,
@@ -50,9 +54,10 @@ import type {
 } from './types'
 
 const providerStorageKey = 'aimeeting.provider'
+const asrProviderStorageKey = 'aimeeting.asrProvider'
 const searchStorageKey = 'aimeeting.search'
-const segmentsStorageKey = 'aimeeting.segments'
-const responsesStorageKey = 'aimeeting.responses'
+const segmentsStorageKey = 'aimeeting.v2.segments'
+const responsesStorageKey = 'aimeeting.v2.responses'
 const speechLangStorageKey = 'aimeeting.speechLang'
 const wakePhrasesStorageKey = 'aimeeting.wakePhrases'
 
@@ -62,6 +67,12 @@ const defaultProvider: ProviderConfig = {
   model: 'gpt-4.1-mini',
   endpointFlavor: 'chat-completions',
   temperature: 0.25,
+}
+
+const defaultAsrProvider: AsrProviderConfig = {
+  baseUrl: '',
+  apiKey: '',
+  model: '',
 }
 
 const defaultSearch: SearchConfig = {
@@ -81,20 +92,28 @@ const modeMeta: Record<MeetingMode, { label: string; tone: string }> = {
 const speakerOptions = ['Speaker A', 'Speaker B', 'Speaker C', 'Me']
 const sourceOptions: AudioSource[] = ['system', 'microphone', 'mixed']
 
+type WindowWithAudioContext = Window & {
+  webkitAudioContext?: typeof AudioContext
+}
+
 function App() {
   const initialSpeechSupport = getSpeechRecognitionSupport()
   const [mode, setMode] = useState<MeetingMode>('recording')
-  const [segments, setSegments] = useState<MeetingSegment[]>(() => loadJson(segmentsStorageKey, demoSegments))
+  const [segments, setSegments] = useState<MeetingSegment[]>(() => loadJson(segmentsStorageKey, []))
   const [responses, setResponses] = useState<AgentResponse[]>(() => loadJson(responsesStorageKey, []))
   const [provider, setProvider] = useState<ProviderConfig>(() => ({
     ...loadJson(providerStorageKey, defaultProvider),
     apiKey: '',
   }))
+  const [asrProvider, setAsrProvider] = useState<AsrProviderConfig>(() => ({
+    ...loadJson(asrProviderStorageKey, defaultAsrProvider),
+    apiKey: '',
+  }))
   const [searchConfig, setSearchConfig] = useState<SearchConfig>(() => loadJson(searchStorageKey, defaultSearch))
-  const [question, setQuestion] = useState('刚才讨论的方案有什么风险？帮我整理一个下一步计划。')
+  const [question, setQuestion] = useState('')
   const [manualText, setManualText] = useState('')
-  const [manualSpeaker, setManualSpeaker] = useState('Speaker A')
-  const [manualSource, setManualSource] = useState<AudioSource>('mixed')
+  const [manualSpeaker, setManualSpeaker] = useState('Me')
+  const [manualSource, setManualSource] = useState<AudioSource>('microphone')
   const [liveIndex, setLiveIndex] = useState(0)
   const [captureLog, setCaptureLog] = useState<CaptureProbe[]>([])
   const [showEvidence, setShowEvidence] = useState(false)
@@ -108,11 +127,20 @@ function App() {
   const [interimTranscript, setInterimTranscript] = useState('')
   const [lastVoiceTrigger, setLastVoiceTrigger] = useState<VoiceTrigger | null>(null)
   const [autoAskOnWake, setAutoAskOnWake] = useState(false)
+  const [asrRuntime, setAsrRuntime] = useState<AsrRuntimeStatus | null>(null)
 
   const speechSessionRef = useRef<SpeechSession | null>(null)
   const keepListeningRef = useRef(false)
   const segmentsRef = useRef(segments)
   const isThinkingRef = useRef(false)
+  const mediaStreamRef = useRef<MediaStream | null>(null)
+  const audioContextRef = useRef<AudioContext | null>(null)
+  const audioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null)
+  const audioProcessorRef = useRef<ScriptProcessorNode | null>(null)
+  const pcmBufferRef = useRef<Float32Array[]>([])
+  const pcmSampleCountRef = useRef(0)
+  const asrRecordingRef = useRef(false)
+  const asrQueueRef = useRef(Promise.resolve())
 
   const summary = useMemo(() => buildRollingSummary(segments), [segments])
   const latestResponse = responses[0]
@@ -144,6 +172,10 @@ function App() {
   }, [provider])
 
   useEffect(() => {
+    saveJson(asrProviderStorageKey, { ...asrProvider, apiKey: '' })
+  }, [asrProvider])
+
+  useEffect(() => {
     saveJson(speechLangStorageKey, speechLang)
   }, [speechLang])
 
@@ -151,10 +183,15 @@ function App() {
     saveJson(wakePhrasesStorageKey, wakePhrases)
   }, [wakePhrases])
 
+  useEffect(() => {
+    void refreshAsrRuntimeStatus()
+  }, [])
+
   useEffect(
     () => () => {
       keepListeningRef.current = false
       speechSessionRef.current?.abort()
+      stopChunkedAsr()
     },
     [],
   )
@@ -167,13 +204,31 @@ function App() {
     keepListeningRef.current = false
     speechSessionRef.current?.abort()
     speechSessionRef.current = null
+    stopChunkedAsr()
     segmentsRef.current = []
     setSegments([])
     setResponses([])
     setInterimTranscript('')
     setLastVoiceTrigger(null)
+    setQuestion('')
     setSpeechStatus(speechSupport.supported ? 'idle' : 'unsupported')
     setMode('paused')
+  }
+
+  async function refreshAsrRuntimeStatus() {
+    try {
+      const status = await getAsrRuntimeStatus()
+      setAsrRuntime(status)
+    } catch (error) {
+      setCaptureLog((current) => [
+        {
+          ok: false,
+          label: 'ASR runtime check failed',
+          detail: error instanceof Error ? error.message : '无法读取本地 ASR 运行状态。',
+        },
+        ...current,
+      ].slice(0, 4))
+    }
   }
 
   function injectLiveSegment() {
@@ -252,7 +307,173 @@ function App() {
     setCaptureLog((current) => [result, ...current].slice(0, 4))
   }
 
-  function startSpeechRecognition() {
+  async function startChunkedAsr() {
+    if (asrRecordingRef.current) {
+      return
+    }
+
+    keepListeningRef.current = false
+    speechSessionRef.current?.abort()
+    speechSessionRef.current = null
+    pcmBufferRef.current = []
+    pcmSampleCountRef.current = 0
+    asrRecordingRef.current = true
+    setSpeechStatus('listening')
+    setMode('recording')
+    setInterimTranscript('正在采集音频，约每 6 秒转写一次。')
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      const AudioContextCtor = window.AudioContext || (window as WindowWithAudioContext).webkitAudioContext
+      if (!AudioContextCtor) {
+        throw new Error('当前 WebView/浏览器不支持 AudioContext。')
+      }
+      const audioContext = new AudioContextCtor()
+      const source = audioContext.createMediaStreamSource(stream)
+      const processor = audioContext.createScriptProcessor(4096, 1, 1)
+      const chunkSamples = audioContext.sampleRate * 6
+
+      processor.onaudioprocess = (event) => {
+        const output = event.outputBuffer.getChannelData(0)
+        output.fill(0)
+
+        if (!asrRecordingRef.current) {
+          return
+        }
+
+        const input = event.inputBuffer.getChannelData(0)
+        const copy = new Float32Array(input.length)
+        copy.set(input)
+        pcmBufferRef.current.push(copy)
+        pcmSampleCountRef.current += copy.length
+
+        if (pcmSampleCountRef.current >= chunkSamples) {
+          const audio = flushWavChunk(audioContext.sampleRate)
+          if (audio) {
+            enqueueAsrChunk(audio)
+          }
+        }
+      }
+
+      source.connect(processor)
+      processor.connect(audioContext.destination)
+      mediaStreamRef.current = stream
+      audioContextRef.current = audioContext
+      audioSourceRef.current = source
+      audioProcessorRef.current = processor
+
+      setCaptureLog((current) => [
+        {
+          ok: true,
+          label: 'Chunked ASR started',
+          detail: asrProvider.apiKey.trim()
+            ? `云端 ASR 优先，失败后自动切换本地 Qwen3-ASR。语言：${speechLang}。`
+            : `使用本地 Qwen3-ASR 分段转写。语言：${speechLang}。`,
+        },
+        ...current,
+      ].slice(0, 4))
+      await refreshAsrRuntimeStatus()
+    } catch (error) {
+      asrRecordingRef.current = false
+      stopAudioGraph()
+      setSpeechStatus('error')
+      setInterimTranscript('')
+      setCaptureLog((current) => [
+        {
+          ok: false,
+          label: 'Chunked ASR start failed',
+          detail: error instanceof Error ? error.message : '无法启动分段 ASR。',
+        },
+        ...current,
+      ].slice(0, 4))
+    }
+  }
+
+  function stopChunkedAsr() {
+    if (asrRecordingRef.current) {
+      const sampleRate = audioContextRef.current?.sampleRate ?? 16000
+      const audio = flushWavChunk(sampleRate)
+      if (audio) {
+        enqueueAsrChunk(audio)
+      }
+    }
+
+    asrRecordingRef.current = false
+    stopAudioGraph()
+    setInterimTranscript('')
+    setSpeechStatus('idle')
+  }
+
+  function enqueueAsrChunk(audio: Blob) {
+    setInterimTranscript('正在转写刚才的音频片段...')
+    asrQueueRef.current = asrQueueRef.current
+      .then(() => transcribeAudioChunk({ audio, provider: asrProvider, language: speechLang }))
+      .then((result) => handleAsrResult(result))
+      .catch((error) => {
+        setSpeechStatus('error')
+        setCaptureLog((current) => [
+          {
+            ok: false,
+            label: 'ASR transcription failed',
+            detail: error instanceof Error ? error.message : '音频转写失败。',
+          },
+          ...current,
+        ].slice(0, 4))
+      })
+      .finally(() => {
+        setInterimTranscript((current) => (current === '正在转写刚才的音频片段...' ? '' : current))
+      })
+  }
+
+  function handleAsrResult(result: AsrTranscriptionResponse) {
+    const text = result.text.trim()
+    if (!text) {
+      return
+    }
+
+    const nextSegments = appendTranscriptSegment(text, 0.88, 'Me', 'microphone')
+    handleTranscriptTrigger(text, nextSegments)
+    setAsrRuntime((current) => ({
+      ...(current ?? { localReady: false }),
+      localReady: Boolean(result.localServerUrl) || current?.localReady || false,
+      localServerUrl: result.localServerUrl ?? current?.localServerUrl,
+    }))
+    setCaptureLog((current) => [
+      {
+        ok: !result.warning,
+        label: result.usedFallback ? 'ASR fallback used' : 'ASR segment transcribed',
+        detail: result.warning ?? `${result.providerLabel} 已写入 1 段会议文本。`,
+      },
+      ...current,
+    ].slice(0, 4))
+  }
+
+  function flushWavChunk(sampleRate: number): Blob | null {
+    const sampleCount = pcmSampleCountRef.current
+    if (sampleCount < sampleRate * 0.6) {
+      return null
+    }
+
+    const samples = mergeSamples(pcmBufferRef.current, sampleCount)
+    pcmBufferRef.current = []
+    pcmSampleCountRef.current = 0
+    return encodeWav(samples, sampleRate)
+  }
+
+  function stopAudioGraph() {
+    audioProcessorRef.current?.disconnect()
+    audioSourceRef.current?.disconnect()
+    mediaStreamRef.current?.getTracks().forEach((track) => track.stop())
+    void audioContextRef.current?.close()
+    audioProcessorRef.current = null
+    audioSourceRef.current = null
+    mediaStreamRef.current = null
+    audioContextRef.current = null
+    pcmBufferRef.current = []
+    pcmSampleCountRef.current = 0
+  }
+
+  function startLegacySpeechRecognition() {
     const support = getSpeechRecognitionSupport()
     setSpeechSupport(support)
 
@@ -282,7 +503,7 @@ function App() {
           {
             ok: true,
             label: 'Mic transcription started',
-            detail: `正在使用 ${speechLang} 实时听写。说出“${wakePhraseList(wakePhrases)[0] ?? '嗨助手'}”可以唤起 Agent。`,
+            detail: `正在使用 ${speechLang} 实时听写。`,
           },
           ...current,
         ].slice(0, 4))
@@ -353,11 +574,20 @@ function App() {
     }
   }
 
-  function stopSpeechRecognition() {
+  function stopLegacySpeechRecognition() {
     keepListeningRef.current = false
     setSpeechStatus('stopping')
     setInterimTranscript('')
     speechSessionRef.current?.stop()
+  }
+
+  function stopActiveTranscription() {
+    if (asrRecordingRef.current) {
+      stopChunkedAsr()
+      return
+    }
+
+    stopLegacySpeechRecognition()
   }
 
   function handleFinalTranscript(text: string, confidence: number) {
@@ -458,13 +688,17 @@ function App() {
           </div>
           <div className={`speech-state ${speechStatus}`}>
             <span>{speechStatusLabel(speechStatus)}</span>
-            <small>{speechSupport.supported ? speechSupport.label : speechSupport.detail}</small>
+            <small>
+              {asrProvider.apiKey.trim()
+                ? 'Cloud ASR first; local Qwen3-ASR fallback.'
+                : `Local Qwen3-ASR${asrRuntime?.localServerUrl ? ` on ${asrRuntime.localServerUrl}` : ' ready on demand.'}`}
+            </small>
           </div>
           <div className="voice-actions">
             <button
               type="button"
               className="icon-command primary"
-              onClick={startSpeechRecognition}
+              onClick={startChunkedAsr}
               disabled={speechStatus === 'listening'}
             >
               <Mic size={18} />
@@ -473,13 +707,23 @@ function App() {
             <button
               type="button"
               className="icon-command"
-              onClick={stopSpeechRecognition}
+              onClick={stopActiveTranscription}
               disabled={speechStatus !== 'listening'}
             >
               <Square size={17} />
               <span>Stop</span>
             </button>
           </div>
+          <button
+            type="button"
+            className="icon-command"
+            onClick={startLegacySpeechRecognition}
+            disabled={speechStatus === 'listening' || !speechSupport.supported}
+            title={speechSupport.detail}
+          >
+            <Languages size={17} />
+            <span>Legacy Web Speech</span>
+          </button>
           <label>
             <span>Language</span>
             <select value={speechLang} onChange={(event) => setSpeechLang(event.target.value)}>
@@ -509,8 +753,44 @@ function App() {
 
         <section className="settings-panel">
           <div className="panel-title">
+            <Languages size={16} />
+            <span>ASR Provider</span>
+          </div>
+          <label>
+            <span>Base URL</span>
+            <input
+              value={asrProvider.baseUrl}
+              onChange={(event) => setAsrProvider((current) => ({ ...current, baseUrl: event.target.value }))}
+              placeholder="leave empty for local Qwen3-ASR"
+            />
+          </label>
+          <label>
+            <span>Model</span>
+            <input
+              value={asrProvider.model}
+              onChange={(event) => setAsrProvider((current) => ({ ...current, model: event.target.value }))}
+              placeholder="whisper-1"
+            />
+          </label>
+          <label>
+            <span>API key</span>
+            <input
+              type="password"
+              value={asrProvider.apiKey}
+              onChange={(event) => setAsrProvider((current) => ({ ...current, apiKey: event.target.value }))}
+              placeholder="kept in memory"
+            />
+          </label>
+          <button type="button" className="icon-command" onClick={refreshAsrRuntimeStatus}>
+            <Activity size={17} />
+            <span>Check local ASR</span>
+          </button>
+        </section>
+
+        <section className="settings-panel">
+          <div className="panel-title">
             <Settings size={16} />
-            <span>Provider</span>
+            <span>Agent Provider</span>
           </div>
           <label>
             <span>Base URL</span>
@@ -611,8 +891,8 @@ function App() {
       <main className="workspace">
         <header className="topbar">
           <div>
-            <p className="eyebrow">Windows-first prototype</p>
-            <h2>Live meeting notes</h2>
+            <p className="eyebrow">Realtime notes</p>
+            <h2>Meeting notes</h2>
           </div>
           <div className="capture-actions">
             <button type="button" className="ghost-button" onClick={() => probe('mic')}>
@@ -636,7 +916,7 @@ function App() {
         <section className="memory-band">
           <div className="panel-title">
             <Sparkles size={17} />
-            <span>Rolling summary</span>
+            <span>Summary</span>
           </div>
           <p>{summary}</p>
           {interimTranscript ? (
@@ -649,7 +929,7 @@ function App() {
             <div className="wake-line">
               <Keyboard size={15} />
               <span>
-                已捕获触发词“{lastVoiceTrigger.phrase}”，Agent 问题已填入：{lastVoiceTrigger.question}
+                已捕获触发词“{lastVoiceTrigger.phrase}”，问题已填入：{lastVoiceTrigger.question}
               </span>
             </div>
           ) : null}
@@ -665,18 +945,23 @@ function App() {
         <section className="timeline-section">
           <div className="section-head">
             <div>
-              <p className="eyebrow">Transcript event log</p>
-              <h2>Segment stream</h2>
+              <p className="eyebrow">Transcript</p>
+              <h2>Segments</h2>
             </div>
             <span className="small-badge">{segments.filter((segment) => segment.status === 'final').length} final</span>
           </div>
           <div className="timeline-list">
-            {segments
-              .slice()
-              .reverse()
-              .map((segment) => (
-                <SegmentRow key={segment.id} segment={segment} />
-              ))}
+            {segments.length === 0 ? (
+              <div className="empty-timeline">
+                <Mic size={24} />
+                <p>点击 Start mic 开始记录，或手动添加一段测试文本。</p>
+              </div>
+            ) : (
+              segments
+                .slice()
+                .reverse()
+                .map((segment) => <SegmentRow key={segment.id} segment={segment} />)
+            )}
           </div>
         </section>
 
@@ -704,7 +989,7 @@ function App() {
               <input
                 value={manualText}
                 onChange={(event) => setManualText(event.target.value)}
-                placeholder="输入一段新的会议 transcript"
+                placeholder="输入测试文本，例如：嗨助手 总结刚才内容"
               />
               <button type="submit" className="icon-command primary">
                 <Plus size={17} />
@@ -721,7 +1006,12 @@ function App() {
           <span>Copilot</span>
         </div>
         <form className="ask-box" onSubmit={askAgent}>
-          <textarea value={question} onChange={(event) => setQuestion(event.target.value)} rows={5} />
+          <textarea
+            value={question}
+            onChange={(event) => setQuestion(event.target.value)}
+            rows={5}
+            placeholder="输入问题，或说：嗨助手 总结刚才内容"
+          />
           <button type="submit" className="send-button" disabled={isThinking || !question.trim()}>
             {isThinking ? <Loader2 size={18} className="spin" /> : <Send size={18} />}
             <span>{isThinking ? 'Thinking' : 'Ask'}</span>
@@ -759,7 +1049,7 @@ function App() {
         ) : (
           <div className="empty-state">
             <Bot size={24} />
-            <p>Ask from the current meeting notes.</p>
+            <p>等待会议内容后再提问。</p>
           </div>
         )}
 
@@ -777,7 +1067,7 @@ function App() {
             <span>Capture log</span>
           </div>
           {captureLog.length === 0 ? (
-            <p className="muted-copy">No capture events yet.</p>
+            <p className="muted-copy">暂无事件。</p>
           ) : (
             captureLog.map((probeResult) => (
               <div key={`${probeResult.label}-${probeResult.detail}`} className={`probe-row ${probeResult.ok ? 'ok' : 'bad'}`}>
@@ -841,7 +1131,7 @@ function EvidenceList({ response }: { response: AgentResponse }) {
 
 function SearchTrail({ traces }: { traces: SearchTrace[] }) {
   if (traces.length === 0) {
-    return <p className="muted-copy">No search trail for the latest answer.</p>
+    return <p className="muted-copy">暂无搜索记录。</p>
   }
 
   return (
@@ -910,6 +1200,55 @@ function speechStatusLabel(status: SpeechRecognitionStatus): string {
     case 'idle':
     default:
       return 'Idle'
+  }
+}
+
+function mergeSamples(chunks: Float32Array[], sampleCount: number): Float32Array {
+  const merged = new Float32Array(sampleCount)
+  let offset = 0
+
+  for (const chunk of chunks) {
+    merged.set(chunk, offset)
+    offset += chunk.length
+  }
+
+  return merged
+}
+
+function encodeWav(samples: Float32Array, sampleRate: number): Blob {
+  const bytesPerSample = 2
+  const channels = 1
+  const dataSize = samples.length * bytesPerSample
+  const buffer = new ArrayBuffer(44 + dataSize)
+  const view = new DataView(buffer)
+
+  writeAscii(view, 0, 'RIFF')
+  view.setUint32(4, 36 + dataSize, true)
+  writeAscii(view, 8, 'WAVE')
+  writeAscii(view, 12, 'fmt ')
+  view.setUint32(16, 16, true)
+  view.setUint16(20, 1, true)
+  view.setUint16(22, channels, true)
+  view.setUint32(24, sampleRate, true)
+  view.setUint32(28, sampleRate * channels * bytesPerSample, true)
+  view.setUint16(32, channels * bytesPerSample, true)
+  view.setUint16(34, 16, true)
+  writeAscii(view, 36, 'data')
+  view.setUint32(40, dataSize, true)
+
+  let offset = 44
+  for (const sample of samples) {
+    const clamped = Math.max(-1, Math.min(1, sample))
+    view.setInt16(offset, clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff, true)
+    offset += 2
+  }
+
+  return new Blob([buffer], { type: 'audio/wav' })
+}
+
+function writeAscii(view: DataView, offset: number, value: string) {
+  for (let index = 0; index < value.length; index += 1) {
+    view.setUint8(offset + index, value.charCodeAt(index))
   }
 }
 
