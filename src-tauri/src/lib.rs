@@ -222,15 +222,12 @@ async fn transcribe_with_local(
         .file_name(format!("chunk.{extension}"))
         .mime_str(&request.mime_type)
         .map_err(|error| format!("音频 MIME 类型无效：{error}"))?;
-    let mut form = multipart::Form::new()
+    let form = multipart::Form::new()
         .text("response_format", "json")
         .text("language", language_code(&request.language).to_string())
         .text("temperature", "0")
         .text("temperature_inc", "0")
         .part("file", part);
-    if let Some(prompt) = whisper_initial_prompt(&request.language) {
-        form = form.text("prompt", prompt.to_string());
-    }
     let response = client
         .post(format!("{server_url}/inference"))
         .multipart(form)
@@ -297,8 +294,13 @@ async fn ensure_local_asr_server(state: &tauri::State<'_, AsrState>) -> Result<S
         .arg(port.to_string())
         .arg("-l")
         .arg("auto")
+        .arg("-mc")
+        .arg("0")
+        .arg("-nf")
         .arg("-nt")
         .arg("-sns")
+        .arg("-nth")
+        .arg("0.75")
         .arg("--vad")
         .arg("--vad-model")
         .arg(vad_model)
@@ -547,14 +549,6 @@ fn cloud_language_code(language: &str) -> &'static str {
     language_code(language)
 }
 
-fn whisper_initial_prompt(language: &str) -> Option<&'static str> {
-    if language.starts_with("zh") {
-        Some("以下是会议录音，请转写为简体中文。")
-    } else {
-        None
-    }
-}
-
 fn clean_asr_text(raw: String) -> Option<String> {
     let mut text = raw
         .lines()
@@ -583,7 +577,56 @@ fn clean_asr_text(raw: String) -> Option<String> {
         .replace("<|im_end|>", "")
         .trim()
         .to_string();
+    if is_instruction_echo(&text) || is_common_silence_hallucination(&text) {
+        return None;
+    }
     (!text.is_empty()).then_some(text)
+}
+
+fn is_instruction_echo(text: &str) -> bool {
+    let normalized = normalize_asr_text(text);
+    matches!(
+        normalized.as_str(),
+        "请转写为简体中文"
+            | "请转写成简体中文"
+            | "请转写为中文"
+            | "以下是会议录音请转写为简体中文"
+            | "以下是会议录音请转写成简体中文"
+    )
+}
+
+fn is_common_silence_hallucination(text: &str) -> bool {
+    let normalized = normalize_asr_text(text);
+    matches!(
+        normalized.as_str(),
+        "还有一点点点" | "还有一点点" | "谢谢观看" | "感谢观看" | "字幕由Amaraorg社区提供"
+    )
+}
+
+fn normalize_asr_text(text: &str) -> String {
+    text.chars()
+        .filter(|character| {
+            !character.is_whitespace()
+                && !matches!(
+                    character,
+                    '。' | '，'
+                        | ','
+                        | '.'
+                        | '！'
+                        | '!'
+                        | '？'
+                        | '?'
+                        | '、'
+                        | '：'
+                        | ':'
+                        | '；'
+                        | ';'
+                        | '“'
+                        | '”'
+                        | '"'
+                )
+        })
+        .collect()
 }
 
 fn truncate(value: &str, max: usize) -> String {
@@ -608,4 +651,26 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running AIMeeting");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clean_asr_text;
+
+    #[test]
+    fn clean_asr_text_drops_instruction_echoes() {
+        assert_eq!(clean_asr_text("请转写为简体中文。".to_string()), None);
+        assert_eq!(
+            clean_asr_text("以下是会议录音，请转写为简体中文。".to_string()),
+            None
+        );
+    }
+
+    #[test]
+    fn clean_asr_text_keeps_real_transcript() {
+        assert_eq!(
+            clean_asr_text("我们现在讨论本地 Whisper 接入。".to_string()).as_deref(),
+            Some("我们现在讨论本地 Whisper 接入。")
+        );
+    }
 }
