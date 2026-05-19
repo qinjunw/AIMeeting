@@ -3,7 +3,7 @@ import type { AsrProviderConfig, AsrRuntimeStatus, AsrTranscriptionResponse } fr
 
 export async function getAsrRuntimeStatus(): Promise<AsrRuntimeStatus> {
   if (!isTauriRuntime()) {
-    return { localReady: false, runtimeLabel: 'whisper.cpp small + Silero VAD' }
+    return { localReady: false, runtimeLabel: 'whisper.cpp + Silero VAD' }
   }
 
   return invoke<AsrRuntimeStatus>('asr_runtime_status')

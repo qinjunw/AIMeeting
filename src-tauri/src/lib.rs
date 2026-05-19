@@ -72,6 +72,11 @@ struct WhisperServerResponse {
     text: Option<String>,
 }
 
+struct WhisperModelCandidate {
+    file_name: &'static str,
+    min_size_bytes: u64,
+}
+
 const LOCAL_ASR_START_PORT: u16 = 18091;
 const WHISPER_SERVER_ENV: &str = "AIMEETING_WHISPER_SERVER";
 const WHISPER_MODEL_ENV: &str = "AIMEETING_WHISPER_MODEL";
@@ -104,6 +109,12 @@ fn asr_runtime_status(state: tauri::State<'_, AsrState>) -> AsrRuntimeStatus {
     let vad_model_path = find_silero_vad_model();
     let local_available =
         whisper_server_path.is_some() && model_path.is_some() && vad_model_path.is_some();
+    let runtime_label = model_path
+        .as_ref()
+        .and_then(|path| path.file_stem())
+        .and_then(|name| name.to_str())
+        .map(|name| format!("whisper.cpp {name} + Silero VAD"))
+        .unwrap_or_else(|| "whisper.cpp + Silero VAD".to_string());
 
     AsrRuntimeStatus {
         whisper_server_path: whisper_server_path.map(|path| path.display().to_string()),
@@ -111,7 +122,7 @@ fn asr_runtime_status(state: tauri::State<'_, AsrState>) -> AsrRuntimeStatus {
         vad_model_path: vad_model_path.map(|path| path.display().to_string()),
         local_ready: local_server_url.is_some() || local_available,
         local_server_url,
-        runtime_label: "whisper.cpp small + Silero VAD".to_string(),
+        runtime_label,
     }
 }
 
@@ -274,7 +285,7 @@ async fn ensure_local_asr_server(state: &tauri::State<'_, AsrState>) -> Result<S
         format!("找不到 whisper-server.exe。可设置 {WHISPER_SERVER_ENV} 指向 whisper.cpp 的 whisper-server.exe。")
     })?;
     let model = find_whisper_model().ok_or_else(|| {
-        format!("找不到 Whisper 模型。可设置 {WHISPER_MODEL_ENV} 指向 ggml-small.bin。")
+        format!("找不到可用 Whisper 模型。可设置 {WHISPER_MODEL_ENV} 指向完整的 ggml-large-v3-turbo-q5_0.bin 或 ggml-small.bin。")
     })?;
     let vad_model = find_silero_vad_model().ok_or_else(|| {
         format!(
@@ -423,19 +434,52 @@ fn find_whisper_model() -> Option<PathBuf> {
 
     let home = user_home()?;
     let model_names = [
-        "ggml-small.bin",
-        "ggml-small-q8_0.bin",
-        "ggml-small-q5_0.bin",
-        "ggml-small-q5_1.bin",
-        "ggml-base.bin",
-        "ggml-base-q8_0.bin",
-        "ggml-tiny.bin",
+        WhisperModelCandidate {
+            file_name: "ggml-large-v3-turbo-q5_0.bin",
+            min_size_bytes: 500_000_000,
+        },
+        WhisperModelCandidate {
+            file_name: "ggml-large-v3-turbo-q8_0.bin",
+            min_size_bytes: 780_000_000,
+        },
+        WhisperModelCandidate {
+            file_name: "ggml-large-v3-turbo.bin",
+            min_size_bytes: 1_500_000_000,
+        },
+        WhisperModelCandidate {
+            file_name: "ggml-small.bin",
+            min_size_bytes: 450_000_000,
+        },
+        WhisperModelCandidate {
+            file_name: "ggml-small-q8_0.bin",
+            min_size_bytes: 240_000_000,
+        },
+        WhisperModelCandidate {
+            file_name: "ggml-small-q5_0.bin",
+            min_size_bytes: 170_000_000,
+        },
+        WhisperModelCandidate {
+            file_name: "ggml-small-q5_1.bin",
+            min_size_bytes: 170_000_000,
+        },
+        WhisperModelCandidate {
+            file_name: "ggml-base.bin",
+            min_size_bytes: 130_000_000,
+        },
+        WhisperModelCandidate {
+            file_name: "ggml-base-q8_0.bin",
+            min_size_bytes: 70_000_000,
+        },
+        WhisperModelCandidate {
+            file_name: "ggml-tiny.bin",
+            min_size_bytes: 70_000_000,
+        },
     ];
     for root in [
         home.join(".aimeeting/models/whisper.cpp"),
         home.join(".lmstudio/models"),
     ] {
-        if let Some(path) = find_prioritized_file(&root, &model_names) {
+        if let Some(path) = find_prioritized_model(&root, &model_names) {
             return Some(path);
         }
     }
@@ -478,6 +522,21 @@ fn find_prioritized_file(root: &Path, file_names: &[&str]) -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn find_prioritized_model(root: &Path, candidates: &[WhisperModelCandidate]) -> Option<PathBuf> {
+    for candidate in candidates {
+        if let Some(path) = find_file_named(root, candidate.file_name) {
+            if file_size(&path).is_some_and(|size| size >= candidate.min_size_bytes) {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+fn file_size(path: &Path) -> Option<u64> {
+    fs::metadata(path).ok().map(|metadata| metadata.len())
 }
 
 fn find_file_named(root: &Path, file_name: &str) -> Option<PathBuf> {

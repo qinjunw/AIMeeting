@@ -430,6 +430,27 @@ h3 {
   color: #293035;
 }
 
+.digest-text {
+  white-space: pre-wrap;
+}
+
+.digest-meta {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.digest-meta span {
+  width: fit-content;
+  min-height: 24px;
+  padding: 3px 7px;
+  border-radius: 5px;
+  background: var(--surface-2);
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
 .interim-line,
 .wake-line {
   display: flex;
@@ -475,6 +496,27 @@ h3 {
   flex-direction: column;
   min-height: 360px;
   overflow: hidden;
+}
+
+.raw-debug-section {
+  min-height: unset;
+}
+
+.raw-debug-section details {
+  display: grid;
+}
+
+.raw-debug-section summary {
+  cursor: pointer;
+  list-style: none;
+}
+
+.raw-debug-section summary::-webkit-details-marker {
+  display: none;
+}
+
+.raw-debug-section details:not([open]) .timeline-list {
+  display: none;
 }
 
 .section-head {

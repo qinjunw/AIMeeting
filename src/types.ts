@@ -16,6 +16,14 @@ export type MeetingSegment = {
   createdAt: string
 }
 
+export type MeetingDigest = {
+  text: string
+  updatedAt: string
+  providerLabel: string
+  segmentCount: number
+  error?: string
+}
+
 export type ProviderEndpointFlavor = 'chat-completions' | 'responses'
 
 export type ProviderConfig = {
@@ -113,4 +121,5 @@ export type VoiceTrigger = {
   phrase: string
   transcript: string
   question: string
+  beforeText: string
 }

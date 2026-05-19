@@ -32,8 +32,8 @@ import { formatClock, formatDuration, makeId } from './lib/time'
 import { loadJson, saveJson } from './lib/storage'
 import { probeMicrophone, probeSystemAudio } from './services/audioCapture'
 import { getAsrRuntimeStatus, transcribeAudioChunk } from './services/asrTranscription'
-import { buildRollingSummary } from './services/meetingMemory'
-import { generateAgentDraft } from './services/modelProvider'
+import { normalizeTranscriptText } from './services/chineseText'
+import { generateAgentDraft, generateMeetingDigest } from './services/modelProvider'
 import { runAutoSearch } from './services/searchTool'
 import { createSpeechSession, getSpeechRecognitionSupport } from './services/speechRecognition'
 import type { SpeechSession } from './services/speechRecognition'
@@ -44,6 +44,7 @@ import type {
   AsrTranscriptionResponse,
   AudioSource,
   CaptureProbe,
+  MeetingDigest,
   MeetingMode,
   MeetingSegment,
   ProviderConfig,
@@ -60,6 +61,7 @@ const segmentsStorageKey = 'aimeeting.v2.segments'
 const responsesStorageKey = 'aimeeting.v2.responses'
 const speechLangStorageKey = 'aimeeting.speechLang'
 const wakePhrasesStorageKey = 'aimeeting.wakePhrases'
+const digestStorageKey = 'aimeeting.v1.digest'
 
 const defaultProvider: ProviderConfig = {
   baseUrl: 'https://api.openai.com/v1',
@@ -92,8 +94,26 @@ const modeMeta: Record<MeetingMode, { label: string; tone: string }> = {
 const speakerOptions = ['Speaker A', 'Speaker B', 'Speaker C', 'Me']
 const sourceOptions: AudioSource[] = ['system', 'microphone', 'mixed']
 const asrChunkSeconds = 2
+const wakeSilenceMs = 4000
+const digestUpdateMs = 4000
 const speechRmsThreshold = 0.006
 const speechPeakThreshold = 0.02
+
+const emptyDigest: MeetingDigest = {
+  text: '',
+  updatedAt: '',
+  providerLabel: '',
+  segmentCount: 0,
+}
+
+type DigestStatus = 'idle' | 'pending' | 'updating' | 'error'
+
+type WakeCapture = {
+  phrase: string
+  transcript: string
+  parts: string[]
+  startedAt: string
+}
 
 type WindowWithAudioContext = Window & {
   webkitAudioContext?: typeof AudioContext
@@ -131,11 +151,16 @@ function App() {
   const [lastVoiceTrigger, setLastVoiceTrigger] = useState<VoiceTrigger | null>(null)
   const [autoAskOnWake, setAutoAskOnWake] = useState(false)
   const [asrRuntime, setAsrRuntime] = useState<AsrRuntimeStatus | null>(null)
+  const [meetingDigest, setMeetingDigest] = useState<MeetingDigest>(() => loadJson(digestStorageKey, emptyDigest))
+  const [digestStatus, setDigestStatus] = useState<DigestStatus>('idle')
 
   const speechSessionRef = useRef<SpeechSession | null>(null)
   const keepListeningRef = useRef(false)
   const segmentsRef = useRef(segments)
+  const providerRef = useRef(provider)
+  const meetingDigestRef = useRef(meetingDigest)
   const isThinkingRef = useRef(false)
+  const autoAskOnWakeRef = useRef(autoAskOnWake)
   const mediaStreamRef = useRef<MediaStream | null>(null)
   const audioContextRef = useRef<AudioContext | null>(null)
   const audioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null)
@@ -144,8 +169,12 @@ function App() {
   const pcmSampleCountRef = useRef(0)
   const asrRecordingRef = useRef(false)
   const asrQueueRef = useRef(Promise.resolve())
+  const asrPendingCountRef = useRef(0)
+  const wakeCaptureRef = useRef<WakeCapture | null>(null)
+  const wakeSilenceTimerRef = useRef<number | null>(null)
+  const digestTimerRef = useRef<number | null>(null)
+  const digestRunningRef = useRef(false)
 
-  const summary = useMemo(() => buildRollingSummary(segments), [segments])
   const latestResponse = responses[0]
   const durationMs = segments.at(-1)?.endMs ?? 0
   const sourceCounts = useMemo(
@@ -160,6 +189,7 @@ function App() {
   useEffect(() => {
     segmentsRef.current = segments
     saveJson(segmentsStorageKey, segments)
+    scheduleDigestUpdate()
   }, [segments])
 
   useEffect(() => {
@@ -171,7 +201,9 @@ function App() {
   }, [searchConfig])
 
   useEffect(() => {
+    providerRef.current = provider
     saveJson(providerStorageKey, { ...provider, apiKey: '' })
+    scheduleDigestUpdate()
   }, [provider])
 
   useEffect(() => {
@@ -187,6 +219,15 @@ function App() {
   }, [wakePhrases])
 
   useEffect(() => {
+    meetingDigestRef.current = meetingDigest
+    saveJson(digestStorageKey, meetingDigest)
+  }, [meetingDigest])
+
+  useEffect(() => {
+    autoAskOnWakeRef.current = autoAskOnWake
+  }, [autoAskOnWake])
+
+  useEffect(() => {
     void refreshAsrRuntimeStatus()
   }, [])
 
@@ -195,6 +236,8 @@ function App() {
       keepListeningRef.current = false
       speechSessionRef.current?.abort()
       stopChunkedAsr()
+      clearWakeSilenceTimer()
+      clearDigestTimer()
     },
     [],
   )
@@ -208,9 +251,15 @@ function App() {
     speechSessionRef.current?.abort()
     speechSessionRef.current = null
     stopChunkedAsr()
+    clearWakeSilenceTimer()
+    wakeCaptureRef.current = null
+    clearDigestTimer()
+    meetingDigestRef.current = emptyDigest
     segmentsRef.current = []
     setSegments([])
     setResponses([])
+    setMeetingDigest(emptyDigest)
+    setDigestStatus('idle')
     setInterimTranscript('')
     setLastVoiceTrigger(null)
     setQuestion('')
@@ -261,9 +310,7 @@ function App() {
       return
     }
 
-    const nextSegments = appendTranscriptSegment(text, 0.86, manualSpeaker, manualSource)
-    setMode('recording')
-    handleTranscriptTrigger(text, nextSegments)
+    handleRecognizedTranscript(text, 0.86, manualSpeaker, manualSource, { finishWakeImmediately: true })
     setManualText('')
   }
 
@@ -308,6 +355,205 @@ function App() {
   async function probe(kind: 'mic' | 'system') {
     const result = kind === 'mic' ? await probeMicrophone() : await probeSystemAudio()
     setCaptureLog((current) => [result, ...current].slice(0, 4))
+  }
+
+  function hasTextProvider(config = providerRef.current) {
+    return Boolean(config.apiKey.trim() && config.baseUrl.trim() && config.model.trim())
+  }
+
+  function clearDigestTimer() {
+    if (digestTimerRef.current) {
+      window.clearTimeout(digestTimerRef.current)
+      digestTimerRef.current = null
+    }
+  }
+
+  function scheduleDigestUpdate() {
+    if (digestRunningRef.current || digestTimerRef.current) {
+      return
+    }
+
+    const currentDigest = meetingDigestRef.current
+    if (!hasTextProvider() || segmentsRef.current.length === 0 || segmentsRef.current.length <= currentDigest.segmentCount) {
+      return
+    }
+
+    setDigestStatus('pending')
+    digestTimerRef.current = window.setTimeout(() => {
+      digestTimerRef.current = null
+      void runDigestUpdate()
+    }, digestUpdateMs)
+  }
+
+  async function runDigestUpdate() {
+    if (digestRunningRef.current) {
+      return
+    }
+
+    const providerConfig = providerRef.current
+    if (!hasTextProvider(providerConfig)) {
+      setDigestStatus('idle')
+      return
+    }
+
+    const currentDigest = meetingDigestRef.current
+    const segmentStart = Math.min(currentDigest.segmentCount, segmentsRef.current.length)
+    const newSegments = segmentsRef.current.slice(segmentStart)
+    if (newSegments.length === 0) {
+      setDigestStatus('idle')
+      return
+    }
+
+    digestRunningRef.current = true
+    setDigestStatus('updating')
+    const result = await generateMeetingDigest({
+      previousDigest: currentDigest.text,
+      newSegments,
+      provider: providerConfig,
+    })
+
+    const nextDigest: MeetingDigest = result.error
+      ? {
+          ...currentDigest,
+          updatedAt: new Date().toISOString(),
+          providerLabel: result.providerLabel,
+          error: result.error,
+        }
+      : {
+          text: result.digest,
+          updatedAt: new Date().toISOString(),
+          providerLabel: result.providerLabel,
+          segmentCount: segmentsRef.current.length,
+        }
+
+    meetingDigestRef.current = nextDigest
+    setMeetingDigest(nextDigest)
+    setDigestStatus(result.error ? 'error' : 'idle')
+    digestRunningRef.current = false
+
+    if (!result.error && segmentsRef.current.length > nextDigest.segmentCount) {
+      scheduleDigestUpdate()
+    }
+  }
+
+  function clearWakeSilenceTimer() {
+    if (wakeSilenceTimerRef.current) {
+      window.clearTimeout(wakeSilenceTimerRef.current)
+      wakeSilenceTimerRef.current = null
+    }
+  }
+
+  function scheduleWakeCaptureSilence() {
+    clearWakeSilenceTimer()
+    wakeSilenceTimerRef.current = window.setTimeout(() => {
+      if (asrPendingCountRef.current > 0) {
+        scheduleWakeCaptureSilence()
+        return
+      }
+      finalizeWakeCapture()
+    }, wakeSilenceMs)
+  }
+
+  function startWakeCapture(trigger: VoiceTrigger) {
+    wakeCaptureRef.current = {
+      phrase: trigger.phrase,
+      transcript: trigger.transcript,
+      parts: [],
+      startedAt: new Date().toISOString(),
+    }
+    setLastVoiceTrigger({ ...trigger, question: '' })
+    setQuestion('')
+    setMode('dialogue')
+    setInterimTranscript(`已捕获触发词“${trigger.phrase}”，继续说你的要求。`)
+    scheduleWakeCaptureSilence()
+  }
+
+  function appendWakeCommandText(text: string) {
+    const capture = wakeCaptureRef.current
+    if (!capture) {
+      return
+    }
+
+    const cleanText = normalizeTranscriptText(text)
+    if (cleanText) {
+      capture.parts.push(cleanText)
+    }
+
+    const command = buildWakeCommand(capture)
+    setQuestion(command)
+    setLastVoiceTrigger({
+      phrase: capture.phrase,
+      transcript: capture.transcript,
+      question: command,
+      beforeText: '',
+    })
+    setInterimTranscript(command ? `正在采集助手请求：${command}` : `已捕获触发词“${capture.phrase}”，继续说你的要求。`)
+    scheduleWakeCaptureSilence()
+  }
+
+  function finalizeWakeCapture() {
+    const capture = wakeCaptureRef.current
+    if (!capture) {
+      return
+    }
+
+    clearWakeSilenceTimer()
+    wakeCaptureRef.current = null
+    const command = buildWakeCommand(capture) || '请基于当前会议纪要总结重点、待办事项和风险。'
+    setQuestion(command)
+    setLastVoiceTrigger({
+      phrase: capture.phrase,
+      transcript: capture.transcript,
+      question: command,
+      beforeText: '',
+    })
+    setInterimTranscript('')
+    setMode('dialogue')
+
+    if (autoAskOnWakeRef.current) {
+      void runAgentQuestion(command, segmentsRef.current)
+    }
+  }
+
+  function handleRecognizedTranscript(
+    rawText: string,
+    confidence: number,
+    speakerLabel: string,
+    source: AudioSource,
+    options: { finishWakeImmediately?: boolean } = {},
+  ): MeetingSegment[] {
+    const cleanText = normalizeTranscriptText(rawText)
+    if (!cleanText) {
+      return segmentsRef.current
+    }
+
+    if (wakeCaptureRef.current) {
+      appendWakeCommandText(cleanText)
+      if (options.finishWakeImmediately) {
+        finalizeWakeCapture()
+      }
+      return segmentsRef.current
+    }
+
+    const trigger = extractVoiceTrigger(cleanText, wakePhraseList(wakePhrases))
+    if (!trigger) {
+      return appendTranscriptSegment(cleanText, confidence, speakerLabel, source)
+    }
+
+    let nextSegments = segmentsRef.current
+    if (trigger.beforeText) {
+      nextSegments = appendTranscriptSegment(trigger.beforeText, confidence, speakerLabel, source)
+    }
+
+    startWakeCapture(trigger)
+    if (trigger.question) {
+      appendWakeCommandText(trigger.question)
+    }
+    if (options.finishWakeImmediately) {
+      finalizeWakeCapture()
+    }
+
+    return nextSegments
   }
 
   async function startChunkedAsr() {
@@ -409,6 +655,7 @@ function App() {
 
   function enqueueAsrChunk(audio: Blob) {
     setInterimTranscript('正在转写刚才的音频片段...')
+    asrPendingCountRef.current += 1
     asrQueueRef.current = asrQueueRef.current
       .then(() => transcribeAudioChunk({ audio, provider: asrProvider, language: speechLang }))
       .then((result) => handleAsrResult(result))
@@ -424,13 +671,14 @@ function App() {
         ].slice(0, 4))
       })
       .finally(() => {
+        asrPendingCountRef.current = Math.max(0, asrPendingCountRef.current - 1)
         setInterimTranscript((current) => (current === '正在转写刚才的音频片段...' ? '' : current))
       })
   }
 
   function handleAsrResult(result: AsrTranscriptionResponse) {
     setAsrRuntime((current) => ({
-      ...(current ?? { localReady: false, runtimeLabel: 'whisper.cpp small + Silero VAD' }),
+      ...(current ?? { localReady: false, runtimeLabel: 'whisper.cpp + Silero VAD' }),
       localReady: Boolean(result.localServerUrl) || current?.localReady || false,
       localServerUrl: result.localServerUrl ?? current?.localServerUrl,
     }))
@@ -439,13 +687,12 @@ function App() {
       return
     }
 
-    const nextSegments = appendTranscriptSegment(text, 0.88, 'Me', 'microphone')
-    handleTranscriptTrigger(text, nextSegments)
+    handleRecognizedTranscript(text, 0.88, 'Me', 'microphone')
     setCaptureLog((current) => [
       {
         ok: !result.warning,
         label: result.usedFallback ? 'ASR fallback used' : 'ASR segment transcribed',
-        detail: result.warning ?? `${result.providerLabel} 已写入 1 段会议文本。`,
+        detail: result.warning ?? `${result.providerLabel} 已处理 1 段音频文本。`,
       },
       ...current,
     ].slice(0, 4))
@@ -597,28 +844,11 @@ function App() {
   }
 
   function handleFinalTranscript(text: string, confidence: number) {
-    const cleanText = text.trim()
-
-    if (!cleanText) {
+    if (!text.trim()) {
       return
     }
 
-    const nextSegments = appendTranscriptSegment(cleanText, confidence, 'Me', 'microphone')
-    handleTranscriptTrigger(cleanText, nextSegments)
-  }
-
-  function handleTranscriptTrigger(text: string, nextSegments: MeetingSegment[]) {
-    const trigger = extractVoiceTrigger(text, wakePhraseList(wakePhrases))
-
-    if (trigger) {
-      setLastVoiceTrigger(trigger)
-      setMode('dialogue')
-      setQuestion(trigger.question)
-
-      if (autoAskOnWake) {
-        void runAgentQuestion(trigger.question, nextSegments)
-      }
-    }
+    handleRecognizedTranscript(text, confidence, 'Me', 'microphone')
   }
 
   function appendTranscriptSegment(
@@ -648,6 +878,15 @@ function App() {
     setInterimTranscript('')
     return nextSegments
   }
+
+  const digestCopy = meetingDigest.text
+    ? meetingDigest.text
+    : segments.length === 0
+      ? '还没有会议上下文。'
+      : hasTextProvider(provider)
+        ? '正在等待下一次递增纪要更新。'
+        : '已记录原始转写。配置 Agent Provider 的文字模型后，将在这里生成递增会议纪要。'
+  const digestMeta = digestStatusLabel(digestStatus, meetingDigest)
 
   return (
     <div className="app-shell">
@@ -916,7 +1155,7 @@ function App() {
 
         <section className="metrics">
           <Metric icon={Clock} label="Duration" value={formatDuration(durationMs)} />
-          <Metric icon={FileText} label="Segments" value={segments.length.toString()} />
+          <Metric icon={FileText} label="Raw segments" value={segments.length.toString()} />
           <Metric icon={Database} label="Memory" value={`${Math.max(1, Math.round(segments.length * 1.8))} KB`} />
           <Metric icon={Shield} label="Audio retention" value="Transient" />
         </section>
@@ -924,9 +1163,13 @@ function App() {
         <section className="memory-band">
           <div className="panel-title">
             <Sparkles size={17} />
-            <span>Summary</span>
+            <span>Meeting Digest</span>
           </div>
-          <p>{summary}</p>
+          <p className="digest-text">{digestCopy}</p>
+          <div className="digest-meta">
+            <span>{digestMeta}</span>
+            {meetingDigest.providerLabel ? <span>{meetingDigest.providerLabel}</span> : null}
+          </div>
           {interimTranscript ? (
             <div className="interim-line">
               <Languages size={15} />
@@ -937,7 +1180,8 @@ function App() {
             <div className="wake-line">
               <Keyboard size={15} />
               <span>
-                已捕获触发词“{lastVoiceTrigger.phrase}”，问题已填入：{lastVoiceTrigger.question}
+                已捕获触发词“{lastVoiceTrigger.phrase}”
+                {lastVoiceTrigger.question ? `，助手请求：${lastVoiceTrigger.question}` : '，正在采集助手请求。'}
               </span>
             </div>
           ) : null}
@@ -950,27 +1194,31 @@ function App() {
           </div>
         </section>
 
-        <section className="timeline-section">
-          <div className="section-head">
-            <div>
-              <p className="eyebrow">Transcript</p>
-              <h2>Segments</h2>
-            </div>
-            <span className="small-badge">{segments.filter((segment) => segment.status === 'final').length} final</span>
-          </div>
-          <div className="timeline-list">
-            {segments.length === 0 ? (
-              <div className="empty-timeline">
-                <Mic size={24} />
-                <p>点击 Start mic 开始记录，或手动添加一段测试文本。</p>
+        <section className="timeline-section raw-debug-section">
+          <details>
+            <summary className="section-head">
+              <div>
+                <p className="eyebrow">Debug transcript</p>
+                <h2>Raw ASR segments</h2>
               </div>
-            ) : (
-              segments
-                .slice()
-                .reverse()
-                .map((segment) => <SegmentRow key={segment.id} segment={segment} />)
-            )}
-          </div>
+              <span className="small-badge">
+                {segments.filter((segment) => segment.status === 'final').length} final
+              </span>
+            </summary>
+            <div className="timeline-list">
+              {segments.length === 0 ? (
+                <div className="empty-timeline">
+                  <Mic size={24} />
+                  <p>点击 Start mic 开始记录，或手动添加一段测试文本。</p>
+                </div>
+              ) : (
+                segments
+                  .slice()
+                  .reverse()
+                  .map((segment) => <SegmentRow key={segment.id} segment={segment} />)
+              )}
+            </div>
+          </details>
         </section>
 
         <section className="manual-entry">
@@ -1180,6 +1428,10 @@ function extractVoiceTrigger(text: string, phrases: string[]): VoiceTrigger | nu
       continue
     }
 
+    const beforeWake = text
+      .slice(0, index)
+      .replace(/[\s,，。.!！?？:：、]+$/, '')
+      .trim()
     const afterWake = text
       .slice(index + phrase.length)
       .replace(/^[\s,，。.!！?？:：、]+/, '')
@@ -1188,11 +1440,32 @@ function extractVoiceTrigger(text: string, phrases: string[]): VoiceTrigger | nu
     return {
       phrase,
       transcript: text,
-      question: afterWake || '请基于当前会议纪要总结重点、待办事项和风险。',
+      question: afterWake,
+      beforeText: beforeWake,
     }
   }
 
   return null
+}
+
+function buildWakeCommand(capture: WakeCapture): string {
+  return capture.parts.join(' ').replace(/\s+/g, ' ').trim()
+}
+
+function digestStatusLabel(status: DigestStatus, digest: MeetingDigest): string {
+  if (status === 'updating') {
+    return 'Updating digest'
+  }
+  if (status === 'pending') {
+    return 'Digest queued'
+  }
+  if (status === 'error') {
+    return digest.error ? `Digest error: ${digest.error}` : 'Digest error'
+  }
+  if (digest.updatedAt) {
+    return `Updated ${new Date(digest.updatedAt).toLocaleTimeString()}`
+  }
+  return 'Waiting for transcript'
 }
 
 function speechStatusLabel(status: SpeechRecognitionStatus): string {

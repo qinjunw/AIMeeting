@@ -1,5 +1,6 @@
 import type { Evidence, MeetingSegment, ProviderConfig, SearchTrace } from '../types'
 import { rankEvidence, getContextWindow } from './meetingMemory'
+import { toSimplifiedChinese } from './chineseText'
 
 type ChatMessage = {
   role: 'system' | 'user'
@@ -16,8 +17,15 @@ type AgentDraft = {
 
 type ProviderPayload = {
   answer?: string
+  digest?: string
   planItems?: string[]
   plan_items?: string[]
+}
+
+type MeetingDigestDraft = {
+  digest: string
+  providerLabel: string
+  error?: string
 }
 
 export async function generateAgentDraft(params: {
@@ -60,6 +68,38 @@ export async function generateAgentDraft(params: {
   }
 }
 
+export async function generateMeetingDigest(params: {
+  previousDigest: string
+  newSegments: MeetingSegment[]
+  provider: ProviderConfig
+}): Promise<MeetingDigestDraft> {
+  if (!params.provider.apiKey.trim() || !params.provider.baseUrl.trim() || !params.provider.model.trim()) {
+    return {
+      digest: params.previousDigest,
+      providerLabel: 'provider not configured',
+      error: '未配置 OpenAI-compatible 文本模型，递增纪要暂不生成。',
+    }
+  }
+
+  try {
+    const messages = buildDigestMessages(params.previousDigest, params.newSegments)
+    const text = await callProvider(params.provider, messages)
+    const parsed = parseProviderPayload(text)
+    const digest = toSimplifiedChinese(parsed.digest || parsed.answer || text).trim()
+
+    return {
+      digest: digest || params.previousDigest,
+      providerLabel: `${params.provider.model} via ${params.provider.endpointFlavor}`,
+    }
+  } catch (error) {
+    return {
+      digest: params.previousDigest,
+      providerLabel: 'provider error',
+      error: error instanceof Error ? error.message : 'Unknown provider error',
+    }
+  }
+}
+
 function buildMessages(question: string, segments: MeetingSegment[], searches: SearchTrace[]): ChatMessage[] {
   const context = getContextWindow(segments, 16)
   const searchTrail = searches
@@ -85,6 +125,33 @@ function buildMessages(question: string, segments: MeetingSegment[], searches: S
         '',
         'Search trail:',
         searchTrail || '(none)',
+      ].join('\n'),
+    },
+  ]
+}
+
+function buildDigestMessages(previousDigest: string, newSegments: MeetingSegment[]): ChatMessage[] {
+  const newTranscript = getContextWindow(newSegments, newSegments.length)
+
+  return [
+    {
+      role: 'system',
+      content: [
+        '你是实时会议纪要维护助手，只输出严格 JSON。',
+        'JSON 结构为 {"digest":"..."}。',
+        'digest 必须是简体中文会议纪要，不要输出原始逐字稿，不要记录对助手的操作指令。',
+        '根据上一版纪要和新增转写，输出一份完整更新后的递增纪要。',
+        '允许小幅重写、合并重复、修正明显错字，但不要删除已经确认的会议事实。',
+      ].join('\n'),
+    },
+    {
+      role: 'user',
+      content: [
+        '上一版会议纪要：',
+        previousDigest || '(空)',
+        '',
+        '新增会议转写：',
+        newTranscript || '(空)',
       ].join('\n'),
     },
   ]
