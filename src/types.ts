@@ -24,6 +24,21 @@ export type MeetingDigest = {
   error?: string
 }
 
+export type MeetingRecordStatus = 'finalizing' | 'archived' | 'error'
+
+export type MeetingRecord = {
+  id: string
+  title: string
+  status: MeetingRecordStatus
+  segments: MeetingSegment[]
+  digest: MeetingDigest
+  responses: AgentResponse[]
+  createdAt: string
+  updatedAt: string
+  stoppedAt: string
+  error?: string
+}
+
 export type ProviderEndpointFlavor = 'chat-completions' | 'responses'
 
 export type ProviderConfig = {

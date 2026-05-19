@@ -46,6 +46,7 @@ import type {
   CaptureProbe,
   MeetingDigest,
   MeetingMode,
+  MeetingRecord,
   MeetingSegment,
   ProviderConfig,
   SearchConfig,
@@ -59,6 +60,9 @@ const asrProviderStorageKey = 'aimeeting.asrProvider'
 const searchStorageKey = 'aimeeting.search'
 const segmentsStorageKey = 'aimeeting.v2.segments'
 const responsesStorageKey = 'aimeeting.v2.responses'
+const meetingsStorageKey = 'aimeeting.v3.meetings'
+const activeMeetingIdStorageKey = 'aimeeting.v3.activeMeetingId'
+const activeMeetingCreatedAtStorageKey = 'aimeeting.v3.activeMeetingCreatedAt'
 const speechLangStorageKey = 'aimeeting.speechLang'
 const wakePhrasesStorageKey = 'aimeeting.wakePhrases'
 const digestStorageKey = 'aimeeting.v1.digest'
@@ -121,9 +125,15 @@ type WindowWithAudioContext = Window & {
 
 function App() {
   const initialSpeechSupport = getSpeechRecognitionSupport()
-  const [mode, setMode] = useState<MeetingMode>('recording')
+  const [mode, setMode] = useState<MeetingMode>('paused')
+  const [activeMeetingId, setActiveMeetingId] = useState(() => loadJson(activeMeetingIdStorageKey, makeId('meeting')))
+  const [activeMeetingCreatedAt, setActiveMeetingCreatedAt] = useState(() =>
+    loadJson(activeMeetingCreatedAtStorageKey, new Date().toISOString()),
+  )
   const [segments, setSegments] = useState<MeetingSegment[]>(() => loadJson(segmentsStorageKey, []))
   const [responses, setResponses] = useState<AgentResponse[]>(() => loadJson(responsesStorageKey, []))
+  const [meetings, setMeetings] = useState<MeetingRecord[]>(() => loadJson(meetingsStorageKey, []))
+  const [selectedHistoryId, setSelectedHistoryId] = useState<string | null>(null)
   const [provider, setProvider] = useState<ProviderConfig>(() => ({
     ...loadJson(providerStorageKey, defaultProvider),
     apiKey: '',
@@ -156,7 +166,11 @@ function App() {
 
   const speechSessionRef = useRef<SpeechSession | null>(null)
   const keepListeningRef = useRef(false)
+  const activeMeetingIdRef = useRef(activeMeetingId)
+  const activeMeetingCreatedAtRef = useRef(activeMeetingCreatedAt)
   const segmentsRef = useRef(segments)
+  const responsesRef = useRef(responses)
+  const meetingsRef = useRef(meetings)
   const providerRef = useRef(provider)
   const meetingDigestRef = useRef(meetingDigest)
   const isThinkingRef = useRef(false)
@@ -168,8 +182,8 @@ function App() {
   const pcmBufferRef = useRef<Float32Array[]>([])
   const pcmSampleCountRef = useRef(0)
   const asrRecordingRef = useRef(false)
-  const asrQueueRef = useRef(Promise.resolve())
-  const asrPendingCountRef = useRef(0)
+  const asrQueuesRef = useRef<Map<string, Promise<void>>>(new Map())
+  const asrPendingCountRef = useRef<Map<string, number>>(new Map())
   const wakeCaptureRef = useRef<WakeCapture | null>(null)
   const wakeSilenceTimerRef = useRef<number | null>(null)
   const digestTimerRef = useRef<number | null>(null)
@@ -185,6 +199,20 @@ function App() {
       })),
     [segments],
   )
+  const selectedHistory = useMemo(
+    () => meetings.find((meeting) => meeting.id === selectedHistoryId) ?? null,
+    [meetings, selectedHistoryId],
+  )
+
+  useEffect(() => {
+    activeMeetingIdRef.current = activeMeetingId
+    saveJson(activeMeetingIdStorageKey, activeMeetingId)
+  }, [activeMeetingId])
+
+  useEffect(() => {
+    activeMeetingCreatedAtRef.current = activeMeetingCreatedAt
+    saveJson(activeMeetingCreatedAtStorageKey, activeMeetingCreatedAt)
+  }, [activeMeetingCreatedAt])
 
   useEffect(() => {
     segmentsRef.current = segments
@@ -193,8 +221,14 @@ function App() {
   }, [segments])
 
   useEffect(() => {
+    responsesRef.current = responses
     saveJson(responsesStorageKey, responses)
   }, [responses])
+
+  useEffect(() => {
+    meetingsRef.current = meetings
+    saveJson(meetingsStorageKey, meetings)
+  }, [meetings])
 
   useEffect(() => {
     saveJson(searchStorageKey, searchConfig)
@@ -242,20 +276,94 @@ function App() {
     [],
   )
 
+  function setMeetingsState(updater: (current: MeetingRecord[]) => MeetingRecord[]) {
+    setMeetings((current) => {
+      const nextMeetings = updater(current)
+      meetingsRef.current = nextMeetings
+      return nextMeetings
+    })
+  }
+
+  function updateHistoricalMeeting(meetingId: string, updater: (meeting: MeetingRecord) => MeetingRecord) {
+    setMeetingsState((current) => current.map((meeting) => (meeting.id === meetingId ? updater(meeting) : meeting)))
+  }
+
+  function resetActiveMeeting(nextMode: MeetingMode = 'paused') {
+    const nextMeetingId = makeId('meeting')
+    const createdAt = new Date().toISOString()
+
+    activeMeetingIdRef.current = nextMeetingId
+    activeMeetingCreatedAtRef.current = createdAt
+    segmentsRef.current = []
+    responsesRef.current = []
+    meetingDigestRef.current = emptyDigest
+    setActiveMeetingId(nextMeetingId)
+    setActiveMeetingCreatedAt(createdAt)
+    setSegments([])
+    setResponses([])
+    setMeetingDigest(emptyDigest)
+    setDigestStatus('idle')
+    setInterimTranscript('')
+    setLastVoiceTrigger(null)
+    setQuestion('')
+    setMode(nextMode)
+  }
+
+  function cancelWakeCapture() {
+    clearWakeSilenceTimer()
+    wakeCaptureRef.current = null
+    setLastVoiceTrigger(null)
+  }
+
+  function archiveActiveMeeting(meetingId: string) {
+    const now = new Date().toISOString()
+    const record: MeetingRecord = {
+      id: meetingId,
+      title: makeMeetingTitle(meetingDigestRef.current, segmentsRef.current, activeMeetingCreatedAtRef.current),
+      status: 'finalizing',
+      segments: segmentsRef.current,
+      digest: meetingDigestRef.current,
+      responses: responsesRef.current,
+      createdAt: activeMeetingCreatedAtRef.current,
+      updatedAt: now,
+      stoppedAt: now,
+    }
+
+    setMeetingsState((current) => [record, ...current.filter((meeting) => meeting.id !== meetingId)].slice(0, 12))
+    setSelectedHistoryId(meetingId)
+    void finalizeArchivedMeeting(meetingId)
+  }
+
   function toggleRecording() {
-    setMode((current) => (current === 'paused' ? 'recording' : 'paused'))
+    if (mode === 'paused') {
+      void startChunkedAsr()
+      return
+    }
+
+    pauseActiveMeeting()
+  }
+
+  function pauseActiveMeeting() {
+    const meetingId = activeMeetingIdRef.current
+    stopChunkedAsr(meetingId)
+    cancelWakeCapture()
+    setQuestion('')
+    setMode('paused')
   }
 
   function clearMeeting() {
     keepListeningRef.current = false
     speechSessionRef.current?.abort()
     speechSessionRef.current = null
-    stopChunkedAsr()
+    stopChunkedAsr(activeMeetingIdRef.current, { flushFinal: false })
     clearWakeSilenceTimer()
     wakeCaptureRef.current = null
     clearDigestTimer()
+    asrPendingCountRef.current.delete(activeMeetingIdRef.current)
+    asrQueuesRef.current.delete(activeMeetingIdRef.current)
     meetingDigestRef.current = emptyDigest
     segmentsRef.current = []
+    responsesRef.current = []
     setSegments([])
     setResponses([])
     setMeetingDigest(emptyDigest)
@@ -299,7 +407,7 @@ function App() {
     segmentsRef.current = nextSegments
     setSegments(nextSegments)
     setLiveIndex((current) => current + 1)
-    setMode('recording')
+    setMode((current) => (current === 'paused' ? current : 'recording'))
   }
 
   function addManualSegment(event: FormEvent<HTMLFormElement>) {
@@ -314,7 +422,11 @@ function App() {
     setManualText('')
   }
 
-  async function runAgentQuestion(trimmed: string, contextSegments = segmentsRef.current) {
+  async function runAgentQuestion(
+    trimmed: string,
+    contextSegments = segmentsRef.current,
+    meetingId = activeMeetingIdRef.current,
+  ) {
     if (!trimmed || isThinkingRef.current) {
       return
     }
@@ -339,10 +451,18 @@ function App() {
       error: draft.error,
     }
 
-    setResponses((current) => [response, ...current].slice(0, 8))
-    setQuestion('')
-    setShowEvidence(false)
-    setMode('dialogue')
+    if (meetingId === activeMeetingIdRef.current) {
+      setResponses((current) => [response, ...current].slice(0, 8))
+      setQuestion('')
+      setShowEvidence(false)
+      setMode('dialogue')
+    } else {
+      updateHistoricalMeeting(meetingId, (meeting) => ({
+        ...meeting,
+        responses: [response, ...meeting.responses].slice(0, 8),
+        updatedAt: new Date().toISOString(),
+      }))
+    }
     setIsThinking(false)
     isThinkingRef.current = false
   }
@@ -390,6 +510,7 @@ function App() {
       return
     }
 
+    const meetingId = activeMeetingIdRef.current
     const providerConfig = providerRef.current
     if (!hasTextProvider(providerConfig)) {
       setDigestStatus('idle')
@@ -397,8 +518,9 @@ function App() {
     }
 
     const currentDigest = meetingDigestRef.current
-    const segmentStart = Math.min(currentDigest.segmentCount, segmentsRef.current.length)
-    const newSegments = segmentsRef.current.slice(segmentStart)
+    const allSegments = segmentsRef.current
+    const segmentStart = Math.min(currentDigest.segmentCount, allSegments.length)
+    const newSegments = allSegments.slice(segmentStart)
     if (newSegments.length === 0) {
       setDigestStatus('idle')
       return
@@ -423,17 +545,83 @@ function App() {
           text: result.digest,
           updatedAt: new Date().toISOString(),
           providerLabel: result.providerLabel,
-          segmentCount: segmentsRef.current.length,
+          segmentCount: allSegments.length,
         }
 
-    meetingDigestRef.current = nextDigest
-    setMeetingDigest(nextDigest)
-    setDigestStatus(result.error ? 'error' : 'idle')
+    if (meetingId === activeMeetingIdRef.current) {
+      meetingDigestRef.current = nextDigest
+      setMeetingDigest(nextDigest)
+      setDigestStatus(result.error ? 'error' : 'idle')
+    } else {
+      updateHistoricalMeeting(meetingId, (meeting) => {
+        if (!result.error && nextDigest.segmentCount < meeting.digest.segmentCount) {
+          return meeting
+        }
+
+        return {
+          ...meeting,
+          digest: nextDigest,
+          title: makeMeetingTitle(nextDigest, meeting.segments, meeting.createdAt),
+          updatedAt: new Date().toISOString(),
+        }
+      })
+    }
     digestRunningRef.current = false
 
-    if (!result.error && segmentsRef.current.length > nextDigest.segmentCount) {
+    if (meetingId === activeMeetingIdRef.current && !result.error && segmentsRef.current.length > nextDigest.segmentCount) {
       scheduleDigestUpdate()
     }
+  }
+
+  async function finalizeArchivedMeeting(meetingId: string) {
+    await (asrQueuesRef.current.get(meetingId) ?? Promise.resolve())
+
+    const meeting = meetingsRef.current.find((item) => item.id === meetingId)
+    if (!meeting) {
+      return
+    }
+
+    const providerConfig = providerRef.current
+    const segmentStart = Math.min(meeting.digest.segmentCount, meeting.segments.length)
+    const newSegments = meeting.segments.slice(segmentStart)
+
+    if (!hasTextProvider(providerConfig) || newSegments.length === 0) {
+      updateHistoricalMeeting(meetingId, (current) => ({
+        ...current,
+        status: 'archived',
+        updatedAt: new Date().toISOString(),
+      }))
+      return
+    }
+
+    const result = await generateMeetingDigest({
+      previousDigest: meeting.digest.text,
+      newSegments,
+      provider: providerConfig,
+    })
+
+    const nextDigest: MeetingDigest = result.error
+      ? {
+          ...meeting.digest,
+          updatedAt: new Date().toISOString(),
+          providerLabel: result.providerLabel,
+          error: result.error,
+        }
+      : {
+          text: result.digest,
+          updatedAt: new Date().toISOString(),
+          providerLabel: result.providerLabel,
+          segmentCount: meeting.segments.length,
+        }
+
+    updateHistoricalMeeting(meetingId, (current) => ({
+      ...current,
+      status: result.error ? 'error' : 'archived',
+      digest: nextDigest,
+      title: makeMeetingTitle(nextDigest, current.segments, current.createdAt),
+      updatedAt: new Date().toISOString(),
+      error: result.error,
+    }))
   }
 
   function clearWakeSilenceTimer() {
@@ -446,7 +634,7 @@ function App() {
   function scheduleWakeCaptureSilence() {
     clearWakeSilenceTimer()
     wakeSilenceTimerRef.current = window.setTimeout(() => {
-      if (asrPendingCountRef.current > 0) {
+      if ((asrPendingCountRef.current.get(activeMeetingIdRef.current) ?? 0) > 0) {
         scheduleWakeCaptureSilence()
         return
       }
@@ -511,7 +699,7 @@ function App() {
     setMode('dialogue')
 
     if (autoAskOnWakeRef.current) {
-      void runAgentQuestion(command, segmentsRef.current)
+      void runAgentQuestion(command, segmentsRef.current, activeMeetingIdRef.current)
     }
   }
 
@@ -561,6 +749,7 @@ function App() {
       return
     }
 
+    const meetingId = activeMeetingIdRef.current
     keepListeningRef.current = false
     speechSessionRef.current?.abort()
     speechSessionRef.current = null
@@ -599,7 +788,7 @@ function App() {
         if (pcmSampleCountRef.current >= chunkSamples) {
           const audio = flushWavChunk(audioContext.sampleRate)
           if (audio) {
-            enqueueAsrChunk(audio)
+            enqueueAsrChunk(audio, meetingId)
           }
         }
       }
@@ -638,29 +827,50 @@ function App() {
     }
   }
 
-  function stopChunkedAsr() {
-    if (asrRecordingRef.current) {
-      const sampleRate = audioContextRef.current?.sampleRate ?? 16000
+  function stopChunkedAsr(
+    meetingId = activeMeetingIdRef.current,
+    options: { flushFinal?: boolean } = { flushFinal: true },
+  ) {
+    const wasRecording = asrRecordingRef.current
+    const sampleRate = audioContextRef.current?.sampleRate ?? 16000
+    asrRecordingRef.current = false
+
+    if (wasRecording && options.flushFinal !== false) {
       const audio = flushWavChunk(sampleRate)
       if (audio) {
-        enqueueAsrChunk(audio)
+        enqueueAsrChunk(audio, meetingId)
       }
     }
 
-    asrRecordingRef.current = false
     stopAudioGraph()
     setInterimTranscript('')
     setSpeechStatus('idle')
   }
 
-  function enqueueAsrChunk(audio: Blob) {
-    setInterimTranscript('正在转写刚才的音频片段...')
-    asrPendingCountRef.current += 1
-    asrQueueRef.current = asrQueueRef.current
-      .then(() => transcribeAudioChunk({ audio, provider: asrProvider, language: speechLang }))
-      .then((result) => handleAsrResult(result))
+  function enqueueAsrChunk(audio: Blob, meetingId = activeMeetingIdRef.current) {
+    const providerSnapshot = asrProvider
+    const languageSnapshot = speechLang
+    const previousQueue = asrQueuesRef.current.get(meetingId) ?? Promise.resolve()
+
+    if (meetingId === activeMeetingIdRef.current) {
+      setInterimTranscript('正在转写刚才的音频片段...')
+    }
+    asrPendingCountRef.current.set(meetingId, (asrPendingCountRef.current.get(meetingId) ?? 0) + 1)
+
+    const nextQueue = previousQueue
+      .then(() => transcribeAudioChunk({ audio, provider: providerSnapshot, language: languageSnapshot }))
+      .then((result) => handleAsrResult(result, meetingId))
       .catch((error) => {
-        setSpeechStatus('error')
+        if (meetingId === activeMeetingIdRef.current) {
+          setSpeechStatus('error')
+        } else {
+          updateHistoricalMeeting(meetingId, (meeting) => ({
+            ...meeting,
+            status: 'error',
+            error: error instanceof Error ? error.message : '音频转写失败。',
+            updatedAt: new Date().toISOString(),
+          }))
+        }
         setCaptureLog((current) => [
           {
             ok: false,
@@ -671,12 +881,16 @@ function App() {
         ].slice(0, 4))
       })
       .finally(() => {
-        asrPendingCountRef.current = Math.max(0, asrPendingCountRef.current - 1)
-        setInterimTranscript((current) => (current === '正在转写刚才的音频片段...' ? '' : current))
+        const nextPending = Math.max(0, (asrPendingCountRef.current.get(meetingId) ?? 1) - 1)
+        asrPendingCountRef.current.set(meetingId, nextPending)
+        if (meetingId === activeMeetingIdRef.current) {
+          setInterimTranscript((current) => (current === '正在转写刚才的音频片段...' ? '' : current))
+        }
       })
+    asrQueuesRef.current.set(meetingId, nextQueue)
   }
 
-  function handleAsrResult(result: AsrTranscriptionResponse) {
+  function handleAsrResult(result: AsrTranscriptionResponse, meetingId = activeMeetingIdRef.current) {
     setAsrRuntime((current) => ({
       ...(current ?? { localReady: false, runtimeLabel: 'whisper.cpp + Silero VAD' }),
       localReady: Boolean(result.localServerUrl) || current?.localReady || false,
@@ -687,7 +901,11 @@ function App() {
       return
     }
 
-    handleRecognizedTranscript(text, 0.88, 'Me', 'microphone')
+    if (meetingId === activeMeetingIdRef.current) {
+      handleRecognizedTranscript(text, 0.88, 'Me', 'microphone')
+    } else {
+      appendHistoricalTranscriptSegment(meetingId, text, 0.88, 'Me', 'microphone')
+    }
     setCaptureLog((current) => [
       {
         ok: !result.warning,
@@ -728,6 +946,7 @@ function App() {
 
   function startLegacySpeechRecognition() {
     const support = getSpeechRecognitionSupport()
+    const meetingId = activeMeetingIdRef.current
     setSpeechSupport(support)
 
     if (!support.supported) {
@@ -785,8 +1004,12 @@ function App() {
 
         setSpeechStatus(speechSupport.supported ? 'idle' : 'unsupported')
       },
-      onInterim: setInterimTranscript,
-      onFinal: handleFinalTranscript,
+      onInterim: (text) => {
+        if (meetingId === activeMeetingIdRef.current) {
+          setInterimTranscript(text)
+        }
+      },
+      onFinal: (text, confidence) => handleFinalTranscript(meetingId, text, confidence),
       onError: (message) => {
         setSpeechStatus('error')
         setCaptureLog((current) => [
@@ -835,20 +1058,71 @@ function App() {
   }
 
   function stopActiveTranscription() {
+    const meetingId = activeMeetingIdRef.current
     if (asrRecordingRef.current) {
-      stopChunkedAsr()
-      return
+      stopChunkedAsr(meetingId)
+    } else {
+      stopLegacySpeechRecognition()
     }
 
-    stopLegacySpeechRecognition()
+    cancelWakeCapture()
+    archiveActiveMeeting(meetingId)
+    resetActiveMeeting('paused')
   }
 
-  function handleFinalTranscript(text: string, confidence: number) {
+  function handleFinalTranscript(meetingId: string, text: string, confidence: number) {
     if (!text.trim()) {
       return
     }
 
-    handleRecognizedTranscript(text, confidence, 'Me', 'microphone')
+    if (meetingId === activeMeetingIdRef.current) {
+      handleRecognizedTranscript(text, confidence, 'Me', 'microphone')
+    } else {
+      appendHistoricalTranscriptSegment(meetingId, text, confidence, 'Me', 'microphone')
+    }
+  }
+
+  function appendHistoricalTranscriptSegment(
+    meetingId: string,
+    text: string,
+    confidence: number,
+    speakerLabel: string,
+    source: AudioSource,
+  ) {
+    const cleanText = normalizeTranscriptText(text)
+    if (!cleanText) {
+      return
+    }
+
+    const trigger = extractVoiceTrigger(cleanText, wakePhraseList(wakePhrases))
+    const meetingText = trigger ? trigger.beforeText : cleanText
+    if (!meetingText) {
+      return
+    }
+
+    updateHistoricalMeeting(meetingId, (meeting) => {
+      const lastEnd = meeting.segments.at(-1)?.endMs ?? 0
+      const estimatedMs = Math.max(1400, Math.min(15000, meetingText.length * 190))
+      const segment: MeetingSegment = {
+        id: makeId('seg'),
+        speakerLabel,
+        source,
+        startMs: lastEnd + 350,
+        endMs: lastEnd + 350 + estimatedMs,
+        text: meetingText,
+        confidence,
+        status: 'final',
+        createdAt: new Date().toISOString(),
+      }
+      const nextSegments = [...meeting.segments, segment]
+
+      return {
+        ...meeting,
+        segments: nextSegments,
+        title: makeMeetingTitle(meeting.digest, nextSegments, meeting.createdAt),
+        updatedAt: new Date().toISOString(),
+      }
+    })
   }
 
   function appendTranscriptSegment(
@@ -876,6 +1150,7 @@ function App() {
     segmentsRef.current = nextSegments
     setSegments(nextSegments)
     setInterimTranscript('')
+    setMode((current) => (current === 'paused' ? current : 'recording'))
     return nextSegments
   }
 
@@ -887,6 +1162,7 @@ function App() {
         ? '正在等待下一次递增纪要更新。'
         : '已记录原始转写。配置 Agent Provider 的文字模型后，将在这里生成递增会议纪要。'
   const digestMeta = digestStatusLabel(digestStatus, meetingDigest)
+  const activeMeetingTitle = makeMeetingTitle(meetingDigest, segments, activeMeetingCreatedAt)
 
   return (
     <div className="app-shell">
@@ -924,6 +1200,41 @@ function App() {
               <span>Clear</span>
             </button>
           </div>
+        </section>
+
+        <section className="settings-panel history-panel">
+          <div className="panel-title">
+            <Clock size={16} />
+            <span>Meeting history</span>
+          </div>
+          {meetings.length === 0 ? (
+            <p className="muted-copy">Stop 后会在这里保存上一段会议。</p>
+          ) : (
+            <div className="history-list">
+              {meetings.slice(0, 8).map((meeting) => (
+                <button
+                  type="button"
+                  key={meeting.id}
+                  className={`history-item ${selectedHistoryId === meeting.id ? 'selected' : ''}`}
+                  onClick={() => setSelectedHistoryId((current) => (current === meeting.id ? null : meeting.id))}
+                >
+                  <span>{meeting.title}</span>
+                  <small>
+                    {meeting.status} · {formatClock(meeting.stoppedAt)}
+                  </small>
+                </button>
+              ))}
+            </div>
+          )}
+          {selectedHistory ? (
+            <div className="history-preview">
+              <strong>{selectedHistory.title}</strong>
+              <p>{selectedHistory.digest.text || '这段会议还没有生成纪要。'}</p>
+              <small>
+                {selectedHistory.segments.length} segments · {selectedHistory.status}
+              </small>
+            </div>
+          ) : null}
         </section>
 
         <section className="settings-panel voice-panel">
@@ -1138,8 +1449,8 @@ function App() {
       <main className="workspace">
         <header className="topbar">
           <div>
-            <p className="eyebrow">Realtime notes</p>
-            <h2>Meeting notes</h2>
+            <p className="eyebrow">Current meeting</p>
+            <h2>{activeMeetingTitle}</h2>
           </div>
           <div className="capture-actions">
             <button type="button" className="ghost-button" onClick={() => probe('mic')}>
@@ -1408,6 +1719,12 @@ function SearchTrail({ traces }: { traces: SearchTrace[] }) {
       ))}
     </div>
   )
+}
+
+function makeMeetingTitle(digest: MeetingDigest, segments: MeetingSegment[], createdAt: string): string {
+  const seed = digest.text || segments[0]?.text || `Meeting ${formatClock(createdAt)}`
+  const normalized = seed.replace(/\s+/g, ' ').trim()
+  return normalized.length > 28 ? `${normalized.slice(0, 28)}...` : normalized
 }
 
 function wakePhraseList(raw: string): string[] {
