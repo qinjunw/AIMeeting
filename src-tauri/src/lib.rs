@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs,
     net::TcpListener,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::Mutex,
     thread,
@@ -33,11 +33,12 @@ struct LocalAsrProcess {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AsrRuntimeStatus {
-    llama_server_path: Option<String>,
+    whisper_server_path: Option<String>,
     model_path: Option<String>,
-    mmproj_path: Option<String>,
+    vad_model_path: Option<String>,
     local_server_url: Option<String>,
     local_ready: bool,
+    runtime_label: String,
 }
 
 #[derive(Deserialize)]
@@ -67,35 +68,14 @@ struct CloudTranscriptionResponse {
 }
 
 #[derive(Deserialize)]
-struct ChatCompletionResponse {
-    choices: Vec<ChatChoice>,
+struct WhisperServerResponse {
+    text: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct ChatChoice {
-    message: ChatMessage,
-}
-
-#[derive(Deserialize)]
-struct ChatMessage {
-    content: String,
-}
-
-#[derive(Deserialize)]
-struct ModelsResponse {
-    data: Option<Vec<ModelItem>>,
-    models: Option<Vec<ModelItem>>,
-}
-
-#[derive(Deserialize)]
-struct ModelItem {
-    id: Option<String>,
-    name: Option<String>,
-    model: Option<String>,
-}
-
-const LOCAL_ASR_MODEL_ID: &str = "qwen3-asr-1.7b";
-const LOCAL_ASR_START_PORT: u16 = 18081;
+const LOCAL_ASR_START_PORT: u16 = 18091;
+const WHISPER_SERVER_ENV: &str = "AIMEETING_WHISPER_SERVER";
+const WHISPER_MODEL_ENV: &str = "AIMEETING_WHISPER_MODEL";
+const SILERO_VAD_MODEL_ENV: &str = "AIMEETING_SILERO_VAD_MODEL";
 
 #[tauri::command]
 fn capture_capabilities() -> CaptureCapabilities {
@@ -119,13 +99,19 @@ fn asr_runtime_status(state: tauri::State<'_, AsrState>) -> AsrRuntimeStatus {
         .lock()
         .ok()
         .and_then(|guard| guard.as_ref().map(|process| process.url.clone()));
+    let whisper_server_path = find_whisper_server();
+    let model_path = find_whisper_model();
+    let vad_model_path = find_silero_vad_model();
+    let local_available =
+        whisper_server_path.is_some() && model_path.is_some() && vad_model_path.is_some();
 
     AsrRuntimeStatus {
-        llama_server_path: find_llama_server().map(|path| path.display().to_string()),
-        model_path: find_qwen_asr_model().map(|path| path.display().to_string()),
-        mmproj_path: find_qwen_asr_mmproj().map(|path| path.display().to_string()),
-        local_ready: local_server_url.is_some(),
+        whisper_server_path: whisper_server_path.map(|path| path.display().to_string()),
+        model_path: model_path.map(|path| path.display().to_string()),
+        vad_model_path: vad_model_path.map(|path| path.display().to_string()),
+        local_ready: local_server_url.is_some() || local_available,
         local_server_url,
+        runtime_label: "whisper.cpp small + Silero VAD".to_string(),
     }
 }
 
@@ -160,7 +146,7 @@ async fn transcribe_audio_chunk(
             Err(error) => {
                 let local = transcribe_with_local(&state, &request, &audio).await?;
                 return Ok(TranscribeAudioResponse {
-                    warning: Some(format!("云端 ASR 失败，已自动切换本地 Qwen3-ASR：{error}")),
+                    warning: Some(format!("云端 ASR 失败，已自动切换本地 Whisper：{error}")),
                     used_fallback: true,
                     ..local
                 });
@@ -184,7 +170,10 @@ async fn transcribe_with_cloud(
         .map_err(|error| format!("音频 MIME 类型无效：{error}"))?;
     let form = multipart::Form::new()
         .text("model", request.cloud_model.trim().to_string())
-        .text("language", cloud_language_code(&request.language).to_string())
+        .text(
+            "language",
+            cloud_language_code(&request.language).to_string(),
+        )
         .part("file", part);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(45))
@@ -204,7 +193,10 @@ async fn transcribe_with_cloud(
             .text()
             .await
             .unwrap_or_else(|_| "无法读取错误详情".to_string());
-        return Err(format!("云端 ASR 返回 {status}: {}", truncate(&detail, 240)));
+        return Err(format!(
+            "云端 ASR 返回 {status}: {}",
+            truncate(&detail, 240)
+        ));
     }
 
     let payload = response
@@ -222,41 +214,29 @@ async fn transcribe_with_local(
 ) -> Result<TranscribeAudioResponse, String> {
     let server_url = ensure_local_asr_server(state).await?;
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(90))
+        .timeout(Duration::from_secs(60))
         .build()
         .map_err(|error| format!("无法创建本地 ASR HTTP 客户端：{error}"))?;
-    let body = serde_json::json!({
-        "model": LOCAL_ASR_MODEL_ID,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": format!(
-                            "Transcribe the audio in {}. Return only the recognized text.",
-                            local_language_hint(&request.language)
-                        )
-                    },
-                    {
-                        "type": "input_audio",
-                        "input_audio": {
-                            "data": base64::engine::general_purpose::STANDARD.encode(audio),
-                            "format": audio_format(&request.mime_type)
-                        }
-                    }
-                ]
-            }
-        ],
-        "temperature": 0,
-        "max_tokens": 192
-    });
+    let extension = audio_extension(&request.mime_type);
+    let part = multipart::Part::bytes(audio.to_vec())
+        .file_name(format!("chunk.{extension}"))
+        .mime_str(&request.mime_type)
+        .map_err(|error| format!("音频 MIME 类型无效：{error}"))?;
+    let mut form = multipart::Form::new()
+        .text("response_format", "json")
+        .text("language", language_code(&request.language).to_string())
+        .text("temperature", "0")
+        .text("temperature_inc", "0")
+        .part("file", part);
+    if let Some(prompt) = whisper_initial_prompt(&request.language) {
+        form = form.text("prompt", prompt.to_string());
+    }
     let response = client
-        .post(format!("{server_url}/v1/chat/completions"))
-        .json(&body)
+        .post(format!("{server_url}/inference"))
+        .multipart(form)
         .send()
         .await
-        .map_err(|error| format!("本地 Qwen3-ASR 请求失败：{error}"))?;
+        .map_err(|error| format!("本地 Whisper 请求失败：{error}"))?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -264,23 +244,21 @@ async fn transcribe_with_local(
             .text()
             .await
             .unwrap_or_else(|_| "无法读取错误详情".to_string());
-        return Err(format!("本地 Qwen3-ASR 返回 {status}: {}", truncate(&detail, 240)));
+        return Err(format!(
+            "本地 Whisper 返回 {status}: {}",
+            truncate(&detail, 240)
+        ));
     }
 
     let payload = response
-        .json::<ChatCompletionResponse>()
+        .json::<WhisperServerResponse>()
         .await
-        .map_err(|error| format!("本地 Qwen3-ASR 响应不是预期 JSON：{error}"))?;
-    let raw = payload
-        .choices
-        .first()
-        .map(|choice| choice.message.content.clone())
-        .unwrap_or_default();
-    let text = clean_asr_text(raw).ok_or_else(|| "本地 Qwen3-ASR 没有返回可用文本。".to_string())?;
+        .map_err(|error| format!("本地 Whisper 响应不是预期 JSON：{error}"))?;
+    let text = clean_asr_text(payload.text.unwrap_or_default()).unwrap_or_default();
 
     Ok(TranscribeAudioResponse {
         text,
-        provider_label: "local Qwen3-ASR".to_string(),
+        provider_label: "local Whisper small + Silero VAD".to_string(),
         used_fallback: false,
         warning: None,
         local_server_url: Some(server_url),
@@ -289,40 +267,47 @@ async fn transcribe_with_local(
 
 async fn ensure_local_asr_server(state: &tauri::State<'_, AsrState>) -> Result<String, String> {
     if let Some(url) = current_local_url(state) {
-        if local_server_has_model(&url).await {
+        if local_server_ready(&url).await {
             return Ok(url);
         }
         stop_local_asr_server(state);
     }
 
-    let llama_server = find_llama_server().ok_or_else(|| {
-        "找不到 llama-server.exe。请确认已通过 winget 安装 ggml.llamacpp。".to_string()
+    let whisper_server = find_whisper_server().ok_or_else(|| {
+        format!("找不到 whisper-server.exe。可设置 {WHISPER_SERVER_ENV} 指向 whisper.cpp 的 whisper-server.exe。")
     })?;
-    let model = find_qwen_asr_model().ok_or_else(|| {
-        "找不到 Qwen3-ASR 主模型：Qwen3-ASR-1.7B-Q8_0.gguf。".to_string()
+    let model = find_whisper_model().ok_or_else(|| {
+        format!("找不到 Whisper 模型。可设置 {WHISPER_MODEL_ENV} 指向 ggml-small.bin。")
     })?;
-    let mmproj = find_qwen_asr_mmproj().ok_or_else(|| {
-        "找不到 Qwen3-ASR mmproj：mmproj-Qwen3-ASR-1.7B-bf16.gguf。".to_string()
+    let vad_model = find_silero_vad_model().ok_or_else(|| {
+        format!(
+            "找不到 Silero VAD 模型。可设置 {SILERO_VAD_MODEL_ENV} 指向 ggml-silero-v5.1.2.bin。"
+        )
     })?;
     let port = find_free_port(LOCAL_ASR_START_PORT, 24)
         .ok_or_else(|| "找不到可用于本地 ASR 的空闲端口。".to_string())?;
     let url = format!("http://127.0.0.1:{port}");
-    let mut command = Command::new(llama_server);
+    let mut command = Command::new(whisper_server);
     command
         .arg("-m")
         .arg(model)
-        .arg("--mmproj")
-        .arg(mmproj)
         .arg("--host")
         .arg("127.0.0.1")
         .arg("--port")
         .arg(port.to_string())
-        .arg("--alias")
-        .arg(LOCAL_ASR_MODEL_ID)
-        .arg("--jinja")
-        .arg("-n")
-        .arg("192")
-        .arg("--no-webui")
+        .arg("-l")
+        .arg("auto")
+        .arg("-nt")
+        .arg("-sns")
+        .arg("--vad")
+        .arg("--vad-model")
+        .arg(vad_model)
+        .arg("-vsd")
+        .arg("450")
+        .arg("-vspd")
+        .arg("250")
+        .arg("-vp")
+        .arg("80")
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
@@ -334,7 +319,7 @@ async fn ensure_local_asr_server(state: &tauri::State<'_, AsrState>) -> Result<S
 
     let child = command
         .spawn()
-        .map_err(|error| format!("无法启动本地 Qwen3-ASR 服务：{error}"))?;
+        .map_err(|error| format!("无法启动本地 Whisper 服务：{error}"))?;
 
     {
         let mut guard = state
@@ -347,18 +332,18 @@ async fn ensure_local_asr_server(state: &tauri::State<'_, AsrState>) -> Result<S
         });
     }
 
-    for _ in 0..90 {
-        if local_server_has_model(&url).await {
+    for _ in 0..120 {
+        if local_server_ready(&url).await {
             return Ok(url);
         }
         thread::sleep(Duration::from_millis(500));
     }
 
     stop_local_asr_server(state);
-    Err("本地 Qwen3-ASR 服务启动超时。".to_string())
+    Err("本地 Whisper 服务启动超时。".to_string())
 }
 
-async fn local_server_has_model(url: &str) -> bool {
+async fn local_server_ready(url: &str) -> bool {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()
@@ -366,26 +351,12 @@ async fn local_server_has_model(url: &str) -> bool {
         Ok(client) => client,
         Err(_) => return false,
     };
-    let response = match client.get(format!("{url}/v1/models")).send().await {
-        Ok(response) if response.status().is_success() => response,
-        _ => return false,
-    };
-    let payload = match response.json::<ModelsResponse>().await {
-        Ok(payload) => payload,
-        Err(_) => return false,
-    };
-    let mut models = Vec::new();
-    if let Some(data) = payload.data {
-        models.extend(data);
-    }
-    if let Some(data) = payload.models {
-        models.extend(data);
-    }
-    models.iter().any(|item| {
-        item.id.as_deref() == Some(LOCAL_ASR_MODEL_ID)
-            || item.name.as_deref() == Some(LOCAL_ASR_MODEL_ID)
-            || item.model.as_deref() == Some(LOCAL_ASR_MODEL_ID)
-    })
+    client
+        .get(url)
+        .send()
+        .await
+        .map(|response| response.status().is_success())
+        .unwrap_or(false)
 }
 
 fn current_local_url(state: &tauri::State<'_, AsrState>) -> Option<String> {
@@ -425,38 +396,115 @@ fn find_free_port(start: u16, attempts: u16) -> Option<u16> {
     })
 }
 
-fn find_llama_server() -> Option<PathBuf> {
+fn find_whisper_server() -> Option<PathBuf> {
+    if let Some(path) = existing_path_from_env(WHISPER_SERVER_ENV) {
+        return Some(path);
+    }
+
     let home = user_home()?;
-    let winget_root = home.join("AppData/Local/Microsoft/WinGet/Packages");
-    if let Ok(entries) = fs::read_dir(&winget_root) {
+    for candidate in [
+        home.join(".aimeeting/tools/whisper.cpp/Release/whisper-server.exe"),
+        home.join(".aimeeting/tools/whisper.cpp/whisper-server.exe"),
+    ] {
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    find_on_path("whisper-server.exe")
+}
+
+fn find_whisper_model() -> Option<PathBuf> {
+    if let Some(path) = existing_path_from_env(WHISPER_MODEL_ENV) {
+        return Some(path);
+    }
+
+    let home = user_home()?;
+    let model_names = [
+        "ggml-small.bin",
+        "ggml-small-q8_0.bin",
+        "ggml-small-q5_0.bin",
+        "ggml-small-q5_1.bin",
+        "ggml-base.bin",
+        "ggml-base-q8_0.bin",
+        "ggml-tiny.bin",
+    ];
+    for root in [
+        home.join(".aimeeting/models/whisper.cpp"),
+        home.join(".lmstudio/models"),
+    ] {
+        if let Some(path) = find_prioritized_file(&root, &model_names) {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
+fn find_silero_vad_model() -> Option<PathBuf> {
+    if let Some(path) = existing_path_from_env(SILERO_VAD_MODEL_ENV) {
+        return Some(path);
+    }
+
+    let home = user_home()?;
+    let model_names = [
+        "ggml-silero-v5.1.2.bin",
+        "ggml-silero-v5.1.1.bin",
+        "ggml-silero.bin",
+    ];
+    for root in [
+        home.join(".aimeeting/models/whisper.cpp"),
+        home.join(".lmstudio/models"),
+    ] {
+        if let Some(path) = find_prioritized_file(&root, &model_names) {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
+fn existing_path_from_env(name: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os(name)?);
+    path.exists().then_some(path)
+}
+
+fn find_prioritized_file(root: &Path, file_names: &[&str]) -> Option<PathBuf> {
+    for file_name in file_names {
+        if let Some(path) = find_file_named(root, file_name) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn find_file_named(root: &Path, file_name: &str) -> Option<PathBuf> {
+    if !root.exists() {
+        return None;
+    }
+
+    let mut directories = vec![root.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path
+            if path.is_dir() {
+                directories.push(path);
+                continue;
+            }
+            let matches = path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("ggml.llamacpp_"))
-            {
-                let candidate = path.join("llama-server.exe");
-                if candidate.exists() {
-                    return Some(candidate);
-                }
+                .is_some_and(|name| name.eq_ignore_ascii_case(file_name));
+            if matches {
+                return Some(path);
             }
         }
     }
 
-    find_on_path("llama-server.exe")
-}
-
-fn find_qwen_asr_model() -> Option<PathBuf> {
-    let home = user_home()?;
-    let path = home.join(".lmstudio/models/ggml-org/Qwen3-ASR-1.7B-GGUF/Qwen3-ASR-1.7B-Q8_0.gguf");
-    path.exists().then_some(path)
-}
-
-fn find_qwen_asr_mmproj() -> Option<PathBuf> {
-    let home = user_home()?;
-    let path = home.join(".lmstudio/models/ggml-org/Qwen3-ASR-1.7B-GGUF/mmproj-Qwen3-ASR-1.7B-bf16.gguf");
-    path.exists().then_some(path)
+    None
 }
 
 fn find_on_path(file_name: &str) -> Option<PathBuf> {
@@ -485,19 +533,7 @@ fn audio_extension(mime_type: &str) -> &'static str {
     }
 }
 
-fn audio_format(mime_type: &str) -> &'static str {
-    if mime_type.contains("wav") {
-        "wav"
-    } else if mime_type.contains("mp4") || mime_type.contains("m4a") {
-        "mp4"
-    } else if mime_type.contains("ogg") {
-        "ogg"
-    } else {
-        "webm"
-    }
-}
-
-fn cloud_language_code(language: &str) -> &'static str {
+fn language_code(language: &str) -> &'static str {
     if language.starts_with("zh") {
         "zh"
     } else if language.starts_with("ja") {
@@ -507,18 +543,38 @@ fn cloud_language_code(language: &str) -> &'static str {
     }
 }
 
-fn local_language_hint(language: &str) -> &'static str {
+fn cloud_language_code(language: &str) -> &'static str {
+    language_code(language)
+}
+
+fn whisper_initial_prompt(language: &str) -> Option<&'static str> {
     if language.starts_with("zh") {
-        "Chinese"
-    } else if language.starts_with("ja") {
-        "Japanese"
+        Some("以下是会议录音，请转写为简体中文。")
     } else {
-        "English"
+        None
     }
 }
 
 fn clean_asr_text(raw: String) -> Option<String> {
-    let mut text = raw.trim().to_string();
+    let mut text = raw
+        .lines()
+        .map(|line| {
+            let line = line.trim();
+            if line.starts_with('[') {
+                if let Some(index) = line.find(']') {
+                    return line[index + 1..].trim();
+                }
+            }
+            line
+        })
+        .filter(|line| {
+            !line.is_empty()
+                && !line.eq_ignore_ascii_case("[BLANK_AUDIO]")
+                && !line.eq_ignore_ascii_case("(silence)")
+                && !line.eq_ignore_ascii_case("[silence]")
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
     if let Some(index) = text.find("<asr_text>") {
         text = text[index + "<asr_text>".len()..].to_string();
     }

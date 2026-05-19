@@ -91,6 +91,9 @@ const modeMeta: Record<MeetingMode, { label: string; tone: string }> = {
 
 const speakerOptions = ['Speaker A', 'Speaker B', 'Speaker C', 'Me']
 const sourceOptions: AudioSource[] = ['system', 'microphone', 'mixed']
+const asrChunkSeconds = 2
+const speechRmsThreshold = 0.006
+const speechPeakThreshold = 0.02
 
 type WindowWithAudioContext = Window & {
   webkitAudioContext?: typeof AudioContext
@@ -320,7 +323,7 @@ function App() {
     asrRecordingRef.current = true
     setSpeechStatus('listening')
     setMode('recording')
-    setInterimTranscript('正在采集音频，约每 6 秒转写一次。')
+    setInterimTranscript(`正在采集音频，约每 ${asrChunkSeconds} 秒转写一次。`)
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
@@ -331,7 +334,7 @@ function App() {
       const audioContext = new AudioContextCtor()
       const source = audioContext.createMediaStreamSource(stream)
       const processor = audioContext.createScriptProcessor(4096, 1, 1)
-      const chunkSamples = audioContext.sampleRate * 6
+      const chunkSamples = audioContext.sampleRate * asrChunkSeconds
 
       processor.onaudioprocess = (event) => {
         const output = event.outputBuffer.getChannelData(0)
@@ -367,8 +370,8 @@ function App() {
           ok: true,
           label: 'Chunked ASR started',
           detail: asrProvider.apiKey.trim()
-            ? `云端 ASR 优先，失败后自动切换本地 Qwen3-ASR。语言：${speechLang}。`
-            : `使用本地 Qwen3-ASR 分段转写。语言：${speechLang}。`,
+            ? `云端 ASR 优先，失败后自动切换本地 Whisper。语言：${speechLang}。`
+            : `使用本地 Whisper + Silero VAD 分段转写。语言：${speechLang}。`,
         },
         ...current,
       ].slice(0, 4))
@@ -426,6 +429,11 @@ function App() {
   }
 
   function handleAsrResult(result: AsrTranscriptionResponse) {
+    setAsrRuntime((current) => ({
+      ...(current ?? { localReady: false, runtimeLabel: 'whisper.cpp small + Silero VAD' }),
+      localReady: Boolean(result.localServerUrl) || current?.localReady || false,
+      localServerUrl: result.localServerUrl ?? current?.localServerUrl,
+    }))
     const text = result.text.trim()
     if (!text) {
       return
@@ -433,11 +441,6 @@ function App() {
 
     const nextSegments = appendTranscriptSegment(text, 0.88, 'Me', 'microphone')
     handleTranscriptTrigger(text, nextSegments)
-    setAsrRuntime((current) => ({
-      ...(current ?? { localReady: false }),
-      localReady: Boolean(result.localServerUrl) || current?.localReady || false,
-      localServerUrl: result.localServerUrl ?? current?.localServerUrl,
-    }))
     setCaptureLog((current) => [
       {
         ok: !result.warning,
@@ -457,6 +460,9 @@ function App() {
     const samples = mergeSamples(pcmBufferRef.current, sampleCount)
     pcmBufferRef.current = []
     pcmSampleCountRef.current = 0
+    if (!hasSpeechEnergy(samples)) {
+      return null
+    }
     return encodeWav(samples, sampleRate)
   }
 
@@ -690,8 +696,10 @@ function App() {
             <span>{speechStatusLabel(speechStatus)}</span>
             <small>
               {asrProvider.apiKey.trim()
-                ? 'Cloud ASR first; local Qwen3-ASR fallback.'
-                : `Local Qwen3-ASR${asrRuntime?.localServerUrl ? ` on ${asrRuntime.localServerUrl}` : ' ready on demand.'}`}
+                ? 'Cloud ASR first; local Whisper fallback.'
+                : `${asrRuntime?.runtimeLabel ?? 'Local Whisper'}${
+                    asrRuntime?.localServerUrl ? ` on ${asrRuntime.localServerUrl}` : ' ready on demand.'
+                  }`}
             </small>
           </div>
           <div className="voice-actions">
@@ -761,7 +769,7 @@ function App() {
             <input
               value={asrProvider.baseUrl}
               onChange={(event) => setAsrProvider((current) => ({ ...current, baseUrl: event.target.value }))}
-              placeholder="leave empty for local Qwen3-ASR"
+              placeholder="leave empty for local Whisper"
             />
           </label>
           <label>
@@ -1213,6 +1221,20 @@ function mergeSamples(chunks: Float32Array[], sampleCount: number): Float32Array
   }
 
   return merged
+}
+
+function hasSpeechEnergy(samples: Float32Array): boolean {
+  let sumSquares = 0
+  let peak = 0
+
+  for (const sample of samples) {
+    const value = Math.abs(sample)
+    sumSquares += value * value
+    peak = Math.max(peak, value)
+  }
+
+  const rms = Math.sqrt(sumSquares / Math.max(1, samples.length))
+  return rms >= speechRmsThreshold || peak >= speechPeakThreshold
 }
 
 function encodeWav(samples: Float32Array, sampleRate: number): Blob {

@@ -33,11 +33,12 @@ export type AsrProviderConfig = {
 }
 
 export type AsrRuntimeStatus = {
-  llamaServerPath?: string
+  whisperServerPath?: string
   modelPath?: string
-  mmprojPath?: string
+  vadModelPath?: string
   localServerUrl?: string
   localReady: boolean
+  runtimeLabel: string
 }
 
 export type AsrTranscriptionResponse = {
