@@ -56,6 +56,7 @@ ASR Provider controls microphone transcription:
 
 - `Base URL`: for example `https://api.openai.com/v1` or an OpenAI-compatible cloud gateway.
 - `Model`: for example `whisper-1`.
+- DashScope Qwen ASR uses the same Base URL format, for example `https://dashscope.aliyuncs.com/compatible-mode/v1`, with `Model` set to `qwen3-asr-flash`.
 - `API key`: kept in memory only by the current prototype; it is not persisted to local storage.
 - All three fields are required before **Start mic** is enabled.
 
