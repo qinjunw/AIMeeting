@@ -1,4 +1,4 @@
-export type MeetingMode = 'recording' | 'wake-beta' | 'dialogue' | 'searching' | 'paused'
+export type MeetingMode = 'recording' | 'dialogue' | 'searching' | 'paused'
 
 export type AudioSource = 'system' | 'microphone' | 'mixed'
 

@@ -16,7 +16,6 @@ import {
   Mic,
   Monitor,
   Pause,
-  Play,
   Plus,
   Radio,
   Search,
@@ -26,8 +25,8 @@ import {
   Sparkles,
   Square,
   Trash2,
+  X,
 } from 'lucide-react'
-import { demoLiveSegments } from './data/demoMeeting'
 import { formatClock, formatDuration, makeId } from './lib/time'
 import { loadJson, saveJson } from './lib/storage'
 import { probeMicrophone, probeSystemAudio } from './services/audioCapture'
@@ -89,7 +88,6 @@ const defaultSearch: SearchConfig = {
 
 const modeMeta: Record<MeetingMode, { label: string; tone: string }> = {
   recording: { label: 'Recording', tone: 'green' },
-  'wake-beta': { label: 'Wake beta', tone: 'amber' },
   dialogue: { label: 'Dialogue', tone: 'blue' },
   searching: { label: 'Searching', tone: 'violet' },
   paused: { label: 'Paused', tone: 'muted' },
@@ -147,9 +145,9 @@ function App() {
   const [manualText, setManualText] = useState('')
   const [manualSpeaker, setManualSpeaker] = useState('Me')
   const [manualSource, setManualSource] = useState<AudioSource>('microphone')
-  const [liveIndex, setLiveIndex] = useState(0)
   const [captureLog, setCaptureLog] = useState<CaptureProbe[]>([])
   const [showEvidence, setShowEvidence] = useState(false)
+  const [showAdvancedSettings, setShowAdvancedSettings] = useState(false)
   const [isThinking, setIsThinking] = useState(false)
   const [speechSupport, setSpeechSupport] = useState(initialSpeechSupport)
   const [speechStatus, setSpeechStatus] = useState<SpeechRecognitionStatus>(
@@ -262,6 +260,21 @@ function App() {
   }, [autoAskOnWake])
 
   useEffect(() => {
+    if (!showAdvancedSettings) {
+      return
+    }
+
+    function closeOnEscape(event: KeyboardEvent) {
+      if (event.key === 'Escape') {
+        setShowAdvancedSettings(false)
+      }
+    }
+
+    window.addEventListener('keydown', closeOnEscape)
+    return () => window.removeEventListener('keydown', closeOnEscape)
+  }, [showAdvancedSettings])
+
+  useEffect(() => {
     void refreshAsrRuntimeStatus()
   }, [])
 
@@ -334,15 +347,6 @@ function App() {
     void finalizeArchivedMeeting(meetingId)
   }
 
-  function toggleRecording() {
-    if (mode === 'paused') {
-      void startChunkedAsr()
-      return
-    }
-
-    pauseActiveMeeting()
-  }
-
   function pauseActiveMeeting() {
     const meetingId = activeMeetingIdRef.current
     stopChunkedAsr(meetingId)
@@ -389,25 +393,6 @@ function App() {
         ...current,
       ].slice(0, 4))
     }
-  }
-
-  function injectLiveSegment() {
-    const template = demoLiveSegments[liveIndex % demoLiveSegments.length]
-    const lastEnd = segmentsRef.current.at(-1)?.endMs ?? 0
-    const length = template.endMs - template.startMs
-    const segment: MeetingSegment = {
-      ...template,
-      id: makeId('seg'),
-      startMs: lastEnd + 1200,
-      endMs: lastEnd + 1200 + length,
-      createdAt: new Date().toISOString(),
-    }
-    const nextSegments = [...segmentsRef.current, segment]
-
-    segmentsRef.current = nextSegments
-    setSegments(nextSegments)
-    setLiveIndex((current) => current + 1)
-    setMode((current) => (current === 'paused' ? current : 'recording'))
   }
 
   function addManualSegment(event: FormEvent<HTMLFormElement>) {
@@ -1061,12 +1046,16 @@ function App() {
     const meetingId = activeMeetingIdRef.current
     if (asrRecordingRef.current) {
       stopChunkedAsr(meetingId)
-    } else {
+    } else if (speechStatus === 'listening') {
       stopLegacySpeechRecognition()
+    } else {
+      setSpeechStatus('idle')
     }
 
     cancelWakeCapture()
-    archiveActiveMeeting(meetingId)
+    if (segmentsRef.current.length > 0 || responsesRef.current.length > 0 || meetingDigestRef.current.text) {
+      archiveActiveMeeting(meetingId)
+    }
     resetActiveMeeting('paused')
   }
 
@@ -1163,6 +1152,9 @@ function App() {
         : '已记录原始转写。配置 Agent Provider 的文字模型后，将在这里生成递增会议纪要。'
   const digestMeta = digestStatusLabel(digestStatus, meetingDigest)
   const activeMeetingTitle = makeMeetingTitle(meetingDigest, segments, activeMeetingCreatedAt)
+  const providerSummary = hasTextProvider(provider) ? `Agent ${provider.model}` : 'Agent not configured'
+  const asrSummary = asrProvider.apiKey.trim() ? `Cloud ASR ${asrProvider.model || 'configured'}` : 'Local Whisper'
+  const searchSummary = `Search ${searchConfig.mode}`
 
   return (
     <div className="app-shell">
@@ -1176,31 +1168,6 @@ function App() {
             <h1>Meeting Copilot</h1>
           </div>
         </div>
-
-        <section className="control-panel">
-          <div className={`mode-pill ${modeMeta[mode].tone}`}>
-            <Activity size={16} />
-            <span>{modeMeta[mode].label}</span>
-          </div>
-          <div className="control-grid">
-            <button type="button" className="icon-command primary" onClick={toggleRecording} title="Toggle recording">
-              {mode === 'paused' ? <Play size={18} /> : <Pause size={18} />}
-              <span>{mode === 'paused' ? 'Resume' : 'Pause'}</span>
-            </button>
-            <button type="button" className="icon-command" onClick={() => setMode('wake-beta')} title="Arm wake beta">
-              <Keyboard size={18} />
-              <span>Wake beta</span>
-            </button>
-            <button type="button" className="icon-command" onClick={injectLiveSegment} title="Inject demo segment">
-              <Plus size={18} />
-              <span>Segment</span>
-            </button>
-            <button type="button" className="icon-command" onClick={clearMeeting} title="Clear meeting notes">
-              <Trash2 size={18} />
-              <span>Clear</span>
-            </button>
-          </div>
-        </section>
 
         <section className="settings-panel history-panel">
           <div className="panel-title">
@@ -1242,6 +1209,10 @@ function App() {
             <Mic size={16} />
             <span>Mic transcription</span>
           </div>
+          <div className={`mode-pill compact ${modeMeta[mode].tone}`}>
+            <Activity size={15} />
+            <span>{modeMeta[mode].label}</span>
+          </div>
           <div className={`speech-state ${speechStatus}`}>
             <span>{speechStatusLabel(speechStatus)}</span>
             <small>
@@ -1260,13 +1231,22 @@ function App() {
               disabled={speechStatus === 'listening'}
             >
               <Mic size={18} />
-              <span>Start mic</span>
+              <span>{mode === 'paused' && (segments.length > 0 || meetingDigest.text) ? 'Resume mic' : 'Start mic'}</span>
+            </button>
+            <button
+              type="button"
+              className="icon-command"
+              onClick={pauseActiveMeeting}
+              disabled={speechStatus !== 'listening'}
+            >
+              <Pause size={18} />
+              <span>Pause</span>
             </button>
             <button
               type="button"
               className="icon-command"
               onClick={stopActiveTranscription}
-              disabled={speechStatus !== 'listening'}
+              disabled={speechStatus !== 'listening' && segments.length === 0 && !meetingDigest.text}
             >
               <Square size={17} />
               <span>Stop</span>
@@ -1282,167 +1262,60 @@ function App() {
             <Languages size={17} />
             <span>Legacy Web Speech</span>
           </button>
-          <label>
-            <span>Language</span>
-            <select value={speechLang} onChange={(event) => setSpeechLang(event.target.value)}>
-              <option value="zh-CN">普通话 zh-CN</option>
-              <option value="zh-HK">粤语/香港 zh-HK</option>
-              <option value="en-US">English en-US</option>
-              <option value="ja-JP">日本語 ja-JP</option>
-            </select>
-          </label>
-          <label>
-            <span>Wake phrases</span>
-            <input
-              value={wakePhrases}
-              onChange={(event) => setWakePhrases(event.target.value)}
-              placeholder="嗨助手,嘿助手,hey assistant"
-            />
-          </label>
-          <label className="check-line">
-            <input
-              type="checkbox"
-              checked={autoAskOnWake}
-              onChange={(event) => setAutoAskOnWake(event.target.checked)}
-            />
-            <span>Auto ask after wake</span>
-          </label>
-        </section>
-
-        <section className="settings-panel">
-          <div className="panel-title">
-            <Languages size={16} />
-            <span>ASR Provider</span>
-          </div>
-          <label>
-            <span>Base URL</span>
-            <input
-              value={asrProvider.baseUrl}
-              onChange={(event) => setAsrProvider((current) => ({ ...current, baseUrl: event.target.value }))}
-              placeholder="leave empty for local Whisper"
-            />
-          </label>
-          <label>
-            <span>Model</span>
-            <input
-              value={asrProvider.model}
-              onChange={(event) => setAsrProvider((current) => ({ ...current, model: event.target.value }))}
-              placeholder="whisper-1"
-            />
-          </label>
-          <label>
-            <span>API key</span>
-            <input
-              type="password"
-              value={asrProvider.apiKey}
-              onChange={(event) => setAsrProvider((current) => ({ ...current, apiKey: event.target.value }))}
-              placeholder="kept in memory"
-            />
-          </label>
-          <button type="button" className="icon-command" onClick={refreshAsrRuntimeStatus}>
-            <Activity size={17} />
-            <span>Check local ASR</span>
-          </button>
-        </section>
-
-        <section className="settings-panel">
-          <div className="panel-title">
-            <Settings size={16} />
-            <span>Agent Provider</span>
-          </div>
-          <label>
-            <span>Base URL</span>
-            <input
-              value={provider.baseUrl}
-              onChange={(event) => setProvider((current) => ({ ...current, baseUrl: event.target.value }))}
-              placeholder="https://api.openai.com/v1"
-            />
-          </label>
-          <label>
-            <span>Model</span>
-            <input
-              value={provider.model}
-              onChange={(event) => setProvider((current) => ({ ...current, model: event.target.value }))}
-              placeholder="gpt-4.1-mini"
-            />
-          </label>
-          <label>
-            <span>API key</span>
-            <input
-              type="password"
-              value={provider.apiKey}
-              onChange={(event) => setProvider((current) => ({ ...current, apiKey: event.target.value }))}
-              placeholder="kept in memory"
-            />
-          </label>
-          <div className="two-column">
+          <details className="voice-options">
+            <summary>
+              <span>Voice options</span>
+              <small>{speechLang}</small>
+            </summary>
             <label>
-              <span>Endpoint</span>
-              <select
-                value={provider.endpointFlavor}
-                onChange={(event) =>
-                  setProvider((current) => ({
-                    ...current,
-                    endpointFlavor: event.target.value as ProviderConfig['endpointFlavor'],
-                  }))
-                }
-              >
-                <option value="chat-completions">chat</option>
-                <option value="responses">responses</option>
+              <span>Language</span>
+              <select value={speechLang} onChange={(event) => setSpeechLang(event.target.value)}>
+                <option value="zh-CN">普通话 zh-CN</option>
+                <option value="zh-HK">粤语/香港 zh-HK</option>
+                <option value="en-US">English en-US</option>
+                <option value="ja-JP">日本語 ja-JP</option>
               </select>
             </label>
             <label>
-              <span>Temp</span>
+              <span>Wake phrases</span>
               <input
-                type="number"
-                min="0"
-                max="1"
-                step="0.05"
-                value={provider.temperature}
-                onChange={(event) =>
-                  setProvider((current) => ({ ...current, temperature: Number(event.target.value) }))
-                }
+                value={wakePhrases}
+                onChange={(event) => setWakePhrases(event.target.value)}
+                placeholder="嗨助手,嘿助手,hey assistant"
               />
             </label>
-          </div>
+            <label className="check-line">
+              <input
+                type="checkbox"
+                checked={autoAskOnWake}
+                onChange={(event) => setAutoAskOnWake(event.target.checked)}
+              />
+              <span>Auto ask after wake</span>
+            </label>
+          </details>
+          <button type="button" className="icon-command" onClick={clearMeeting} title="Clear current meeting notes">
+            <Trash2 size={17} />
+            <span>Clear current</span>
+          </button>
         </section>
 
-        <section className="settings-panel">
-          <div className="panel-title">
-            <Search size={16} />
-            <span>Search</span>
-          </div>
-          <label>
-            <span>Mode</span>
-            <select
-              value={searchConfig.mode}
-              onChange={(event) =>
-                setSearchConfig((current) => ({ ...current, mode: event.target.value as SearchConfig['mode'] }))
-              }
-            >
-              <option value="auto">auto</option>
-              <option value="confirm">confirm</option>
-              <option value="off">off</option>
-            </select>
-          </label>
-          <label>
-            <span>Endpoint template</span>
-            <input
-              value={searchConfig.endpointTemplate}
-              onChange={(event) => setSearchConfig((current) => ({ ...current, endpointTemplate: event.target.value }))}
-              placeholder="https://search/api?q={query}"
-            />
-          </label>
-          <label className="check-line">
-            <input
-              type="checkbox"
-              checked={searchConfig.redactBeforeSearch}
-              onChange={(event) =>
-                setSearchConfig((current) => ({ ...current, redactBeforeSearch: event.target.checked }))
-              }
-            />
-            <span>Redact query</span>
-          </label>
+        <section className="settings-panel advanced-settings">
+          <button
+            type="button"
+            className="advanced-trigger"
+            onClick={() => setShowAdvancedSettings(true)}
+            aria-haspopup="dialog"
+          >
+            <div className="panel-title">
+              <Settings size={16} />
+              <span>Advanced settings</span>
+            </div>
+            <div className="settings-summary">
+              <span>{asrSummary}</span>
+              <span>{providerSummary}</span>
+              <span>{searchSummary}</span>
+            </div>
+          </button>
         </section>
       </aside>
 
@@ -1533,37 +1406,42 @@ function App() {
         </section>
 
         <section className="manual-entry">
-          <div className="panel-title">
-            <Plus size={16} />
-            <span>Add transcript segment</span>
-          </div>
-          <form onSubmit={addManualSegment}>
-            <div className="entry-grid">
-              <select value={manualSpeaker} onChange={(event) => setManualSpeaker(event.target.value)}>
-                {speakerOptions.map((speaker) => (
-                  <option key={speaker} value={speaker}>
-                    {speaker}
-                  </option>
-                ))}
-              </select>
-              <select value={manualSource} onChange={(event) => setManualSource(event.target.value as AudioSource)}>
-                {sourceOptions.map((source) => (
-                  <option key={source} value={source}>
-                    {source}
-                  </option>
-                ))}
-              </select>
-              <input
-                value={manualText}
-                onChange={(event) => setManualText(event.target.value)}
-                placeholder="输入测试文本，例如：嗨助手 总结刚才内容"
-              />
-              <button type="submit" className="icon-command primary">
-                <Plus size={17} />
-                <span>Add</span>
-              </button>
-            </div>
-          </form>
+          <details>
+            <summary className="section-head compact">
+              <div className="panel-title">
+                <Plus size={16} />
+                <span>Add transcript segment</span>
+              </div>
+              <span className="small-badge">test tool</span>
+            </summary>
+            <form onSubmit={addManualSegment}>
+              <div className="entry-grid">
+                <select value={manualSpeaker} onChange={(event) => setManualSpeaker(event.target.value)}>
+                  {speakerOptions.map((speaker) => (
+                    <option key={speaker} value={speaker}>
+                      {speaker}
+                    </option>
+                  ))}
+                </select>
+                <select value={manualSource} onChange={(event) => setManualSource(event.target.value as AudioSource)}>
+                  {sourceOptions.map((source) => (
+                    <option key={source} value={source}>
+                      {source}
+                    </option>
+                  ))}
+                </select>
+                <input
+                  value={manualText}
+                  onChange={(event) => setManualText(event.target.value)}
+                  placeholder="输入测试文本，例如：嗨助手 总结刚才内容"
+                />
+                <button type="submit" className="icon-command primary">
+                  <Plus size={17} />
+                  <span>Add</span>
+                </button>
+              </div>
+            </form>
+          </details>
         </section>
       </main>
 
@@ -1645,6 +1523,177 @@ function App() {
           )}
         </section>
       </aside>
+
+      {showAdvancedSettings ? (
+        <div className="modal-backdrop" onMouseDown={() => setShowAdvancedSettings(false)}>
+          <section
+            className="settings-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="advanced-settings-title"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <header className="settings-modal-head">
+              <div>
+                <p className="eyebrow">Configuration</p>
+                <h2 id="advanced-settings-title">Advanced settings</h2>
+              </div>
+              <button
+                type="button"
+                className="modal-close"
+                onClick={() => setShowAdvancedSettings(false)}
+                aria-label="Close advanced settings"
+              >
+                <X size={18} />
+              </button>
+            </header>
+            <div className="settings-stack">
+              <div className="settings-group">
+                <div className="panel-title">
+                  <Languages size={16} />
+                  <span>ASR Provider</span>
+                </div>
+                <label>
+                  <span>Base URL</span>
+                  <input
+                    value={asrProvider.baseUrl}
+                    onChange={(event) => setAsrProvider((current) => ({ ...current, baseUrl: event.target.value }))}
+                    placeholder="leave empty for local Whisper"
+                  />
+                </label>
+                <label>
+                  <span>Model</span>
+                  <input
+                    value={asrProvider.model}
+                    onChange={(event) => setAsrProvider((current) => ({ ...current, model: event.target.value }))}
+                    placeholder="whisper-1"
+                  />
+                </label>
+                <label>
+                  <span>API key</span>
+                  <input
+                    type="password"
+                    value={asrProvider.apiKey}
+                    onChange={(event) => setAsrProvider((current) => ({ ...current, apiKey: event.target.value }))}
+                    placeholder="kept in memory"
+                  />
+                </label>
+                <button type="button" className="icon-command" onClick={refreshAsrRuntimeStatus}>
+                  <Activity size={17} />
+                  <span>Check local ASR</span>
+                </button>
+              </div>
+
+              <div className="settings-group">
+                <div className="panel-title">
+                  <Settings size={16} />
+                  <span>Agent Provider</span>
+                </div>
+                <label>
+                  <span>Base URL</span>
+                  <input
+                    value={provider.baseUrl}
+                    onChange={(event) => setProvider((current) => ({ ...current, baseUrl: event.target.value }))}
+                    placeholder="https://api.openai.com/v1"
+                  />
+                </label>
+                <label>
+                  <span>Model</span>
+                  <input
+                    value={provider.model}
+                    onChange={(event) => setProvider((current) => ({ ...current, model: event.target.value }))}
+                    placeholder="gpt-4.1-mini"
+                  />
+                </label>
+                <label>
+                  <span>API key</span>
+                  <input
+                    type="password"
+                    value={provider.apiKey}
+                    onChange={(event) => setProvider((current) => ({ ...current, apiKey: event.target.value }))}
+                    placeholder="kept in memory"
+                  />
+                </label>
+                <div className="two-column">
+                  <label>
+                    <span>Endpoint</span>
+                    <select
+                      value={provider.endpointFlavor}
+                      onChange={(event) =>
+                        setProvider((current) => ({
+                          ...current,
+                          endpointFlavor: event.target.value as ProviderConfig['endpointFlavor'],
+                        }))
+                      }
+                    >
+                      <option value="chat-completions">chat</option>
+                      <option value="responses">responses</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span>Temp</span>
+                    <input
+                      type="number"
+                      min="0"
+                      max="1"
+                      step="0.05"
+                      value={provider.temperature}
+                      onChange={(event) =>
+                        setProvider((current) => ({ ...current, temperature: Number(event.target.value) }))
+                      }
+                    />
+                  </label>
+                </div>
+              </div>
+
+              <div className="settings-group">
+                <div className="panel-title">
+                  <Search size={16} />
+                  <span>Search</span>
+                </div>
+                <label>
+                  <span>Mode</span>
+                  <select
+                    value={searchConfig.mode}
+                    onChange={(event) =>
+                      setSearchConfig((current) => ({ ...current, mode: event.target.value as SearchConfig['mode'] }))
+                    }
+                  >
+                    <option value="auto">auto</option>
+                    <option value="confirm">confirm</option>
+                    <option value="off">off</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Endpoint template</span>
+                  <input
+                    value={searchConfig.endpointTemplate}
+                    onChange={(event) =>
+                      setSearchConfig((current) => ({ ...current, endpointTemplate: event.target.value }))
+                    }
+                    placeholder="https://search/api?q={query}"
+                  />
+                </label>
+                <label className="check-line">
+                  <input
+                    type="checkbox"
+                    checked={searchConfig.redactBeforeSearch}
+                    onChange={(event) =>
+                      setSearchConfig((current) => ({ ...current, redactBeforeSearch: event.target.checked }))
+                    }
+                  />
+                  <span>Redact query</span>
+                </label>
+              </div>
+            </div>
+            <footer className="settings-modal-foot">
+              <button type="button" className="icon-command primary" onClick={() => setShowAdvancedSettings(false)}>
+                <span>确定</span>
+              </button>
+            </footer>
+          </section>
+        </div>
+      ) : null}
     </div>
   )
 }

@@ -34,6 +34,7 @@ body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
+  overflow: hidden;
   background:
     linear-gradient(90deg, rgba(23, 26, 28, 0.035) 1px, transparent 1px),
     linear-gradient(180deg, rgba(23, 26, 28, 0.035) 1px, transparent 1px),
@@ -118,26 +119,30 @@ h3 {
 .app-shell {
   display: grid;
   grid-template-columns: minmax(260px, 300px) minmax(520px, 1fr) minmax(340px, 410px);
-  gap: 14px;
-  min-height: 100vh;
-  padding: 14px;
+  gap: 10px;
+  height: 100vh;
+  min-height: 0;
+  overflow: hidden;
+  padding: 10px;
 }
 
 .sidebar,
 .workspace,
 .copilot-panel {
   min-width: 0;
+  max-height: calc(100vh - 20px);
+  overflow: auto;
+  scrollbar-gutter: stable;
 }
 
 .sidebar,
 .copilot-panel {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 10px;
 }
 
 .brand-row,
-.control-panel,
 .settings-panel,
 .memory-band,
 .timeline-section,
@@ -156,14 +161,14 @@ h3 {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 14px;
+  padding: 10px 12px;
 }
 
 .brand-mark {
   display: grid;
   place-items: center;
-  flex: 0 0 42px;
-  height: 42px;
+  flex: 0 0 38px;
+  height: 38px;
   border-radius: 8px;
   background: #10201c;
   color: #d9fff1;
@@ -176,11 +181,10 @@ h3 {
   text-transform: uppercase;
 }
 
-.control-panel,
 .settings-panel,
 .search-log,
 .capture-log {
-  padding: 12px;
+  padding: 10px 12px;
 }
 
 .mode-pill {
@@ -215,11 +219,9 @@ h3 {
   background: #586169;
 }
 
-.control-grid {
-  display: grid;
-  grid-template-columns: 1fr;
-  gap: 8px;
-  margin-top: 10px;
+.mode-pill.compact {
+  min-height: 32px;
+  font-size: 12px;
 }
 
 .icon-command,
@@ -288,7 +290,7 @@ h3 {
 
 .settings-panel {
   display: grid;
-  gap: 10px;
+  gap: 8px;
 }
 
 .settings-panel label {
@@ -327,8 +329,165 @@ h3 {
 
 .voice-actions {
   display: grid;
-  grid-template-columns: 1fr 92px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
+}
+
+.voice-actions .primary {
+  grid-column: 1 / -1;
+}
+
+.voice-options {
+  display: grid;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #fff;
+}
+
+.voice-options summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  cursor: pointer;
+  list-style: none;
+  font-weight: 760;
+}
+
+.voice-options summary::-webkit-details-marker {
+  display: none;
+}
+
+.voice-options summary small {
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.voice-options[open] {
+  gap: 10px;
+}
+
+.advanced-settings {
+  padding: 0;
+  overflow: hidden;
+}
+
+.advanced-trigger {
+  display: grid;
+  gap: 8px;
+  width: 100%;
+  padding: 10px 12px;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  text-align: left;
+  cursor: pointer;
+}
+
+.advanced-trigger:hover {
+  background: rgba(34, 95, 212, 0.05);
+}
+
+.settings-summary {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.settings-summary span {
+  min-height: 24px;
+  padding: 3px 7px;
+  border-radius: 5px;
+  background: var(--surface-2);
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.settings-stack {
+  display: grid;
+  gap: 12px;
+  padding: 0 12px 12px;
+}
+
+.settings-group {
+  display: grid;
+  gap: 10px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: grid;
+  place-items: center;
+  padding: 18px;
+  background: rgba(23, 26, 28, 0.34);
+  backdrop-filter: blur(4px);
+}
+
+.settings-modal {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 14px;
+  width: min(980px, calc(100vw - 36px));
+  max-height: min(760px, calc(100vh - 36px));
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 28px 80px rgba(23, 26, 28, 0.28);
+}
+
+.settings-modal-head,
+.settings-modal-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.modal-close {
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  border-radius: 7px;
+  border: 1px solid var(--line-strong);
+  background: #f9faf8;
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.modal-close:hover {
+  border-color: var(--ink);
+}
+
+.settings-modal .settings-stack {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  align-items: start;
+  overflow: auto;
+  padding: 0;
+}
+
+.settings-modal .settings-group {
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #fff;
+}
+
+.settings-modal-foot {
+  justify-content: flex-end;
+}
+
+.settings-modal-foot .icon-command {
+  min-width: 120px;
 }
 
 .history-list {
@@ -388,7 +547,7 @@ h3 {
 .speech-state {
   display: grid;
   gap: 4px;
-  padding: 10px;
+  padding: 8px;
   border-radius: 7px;
   border: 1px solid var(--line);
   background: #fff;
@@ -582,6 +741,15 @@ h3 {
   border-bottom: 1px solid var(--line);
 }
 
+.section-head.compact {
+  padding: 12px 14px;
+  border-bottom: 0;
+}
+
+.manual-entry details[open] .section-head.compact {
+  border-bottom: 1px solid var(--line);
+}
+
 .timeline-list {
   display: grid;
   gap: 1px;
@@ -643,8 +811,29 @@ h3 {
 
 .manual-entry {
   display: grid;
-  gap: 10px;
+  overflow: hidden;
+}
+
+.manual-entry details {
+  display: grid;
+}
+
+.manual-entry summary {
+  cursor: pointer;
+  list-style: none;
+}
+
+.manual-entry summary::-webkit-details-marker {
+  display: none;
+}
+
+.manual-entry details:not([open]) form {
+  display: none;
+}
+
+.manual-entry form {
   padding: 12px;
+  border-top: 1px solid var(--line);
 }
 
 .entry-grid {
@@ -654,7 +843,8 @@ h3 {
 }
 
 .copilot-panel {
-  min-height: calc(100vh - 28px);
+  height: calc(100vh - 20px);
+  min-height: 0;
   padding: 12px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -835,12 +1025,27 @@ h3 {
 }
 
 @media (max-width: 1180px) {
+  body {
+    overflow: auto;
+  }
+
   .app-shell {
     grid-template-columns: 260px minmax(0, 1fr);
+    height: auto;
+    min-height: 100vh;
+    overflow: visible;
+  }
+
+  .sidebar,
+  .workspace,
+  .copilot-panel {
+    max-height: none;
+    overflow: visible;
   }
 
   .copilot-panel {
     grid-column: 1 / -1;
+    height: auto;
     min-height: auto;
   }
 }
@@ -873,5 +1078,20 @@ h3 {
 
   .segment-row {
     grid-template-columns: 1fr;
+  }
+
+  .settings-modal {
+    width: calc(100vw - 20px);
+    max-height: calc(100vh - 20px);
+    padding: 12px;
+  }
+
+  .settings-modal .settings-stack {
+    grid-template-columns: 1fr;
+  }
+
+  .settings-modal-head,
+  .settings-modal-foot {
+    align-items: flex-start;
   }
 }
