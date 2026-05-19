@@ -30,16 +30,13 @@ import {
 import { formatClock, formatDuration, makeId } from './lib/time'
 import { loadJson, saveJson } from './lib/storage'
 import { probeMicrophone, probeSystemAudio } from './services/audioCapture'
-import { getAsrRuntimeStatus, transcribeAudioChunk } from './services/asrTranscription'
+import { transcribeAudioChunk } from './services/asrTranscription'
 import { normalizeTranscriptText } from './services/chineseText'
 import { generateAgentDraft, generateMeetingDigest } from './services/modelProvider'
 import { runAutoSearch } from './services/searchTool'
-import { createSpeechSession, getSpeechRecognitionSupport } from './services/speechRecognition'
-import type { SpeechSession } from './services/speechRecognition'
 import type {
   AgentResponse,
   AsrProviderConfig,
-  AsrRuntimeStatus,
   AsrTranscriptionResponse,
   AudioSource,
   CaptureProbe,
@@ -50,7 +47,7 @@ import type {
   ProviderConfig,
   SearchConfig,
   SearchTrace,
-  SpeechRecognitionStatus,
+  TranscriptionStatus,
   VoiceTrigger,
 } from './types'
 
@@ -75,9 +72,9 @@ const defaultProvider: ProviderConfig = {
 }
 
 const defaultAsrProvider: AsrProviderConfig = {
-  baseUrl: '',
+  baseUrl: 'https://api.openai.com/v1',
   apiKey: '',
-  model: '',
+  model: 'whisper-1',
 }
 
 const defaultSearch: SearchConfig = {
@@ -122,7 +119,6 @@ type WindowWithAudioContext = Window & {
 }
 
 function App() {
-  const initialSpeechSupport = getSpeechRecognitionSupport()
   const [mode, setMode] = useState<MeetingMode>('paused')
   const [activeMeetingId, setActiveMeetingId] = useState(() => loadJson(activeMeetingIdStorageKey, makeId('meeting')))
   const [activeMeetingCreatedAt, setActiveMeetingCreatedAt] = useState(() =>
@@ -149,21 +145,15 @@ function App() {
   const [showEvidence, setShowEvidence] = useState(false)
   const [showAdvancedSettings, setShowAdvancedSettings] = useState(false)
   const [isThinking, setIsThinking] = useState(false)
-  const [speechSupport, setSpeechSupport] = useState(initialSpeechSupport)
-  const [speechStatus, setSpeechStatus] = useState<SpeechRecognitionStatus>(
-    initialSpeechSupport.supported ? 'idle' : 'unsupported',
-  )
+  const [speechStatus, setSpeechStatus] = useState<TranscriptionStatus>('idle')
   const [speechLang, setSpeechLang] = useState(() => loadJson(speechLangStorageKey, 'zh-CN'))
   const [wakePhrases, setWakePhrases] = useState(() => loadJson(wakePhrasesStorageKey, '嗨助手,嘿助手,助手,hey assistant'))
   const [interimTranscript, setInterimTranscript] = useState('')
   const [lastVoiceTrigger, setLastVoiceTrigger] = useState<VoiceTrigger | null>(null)
   const [autoAskOnWake, setAutoAskOnWake] = useState(false)
-  const [asrRuntime, setAsrRuntime] = useState<AsrRuntimeStatus | null>(null)
   const [meetingDigest, setMeetingDigest] = useState<MeetingDigest>(() => loadJson(digestStorageKey, emptyDigest))
   const [digestStatus, setDigestStatus] = useState<DigestStatus>('idle')
 
-  const speechSessionRef = useRef<SpeechSession | null>(null)
-  const keepListeningRef = useRef(false)
   const activeMeetingIdRef = useRef(activeMeetingId)
   const activeMeetingCreatedAtRef = useRef(activeMeetingCreatedAt)
   const segmentsRef = useRef(segments)
@@ -274,14 +264,8 @@ function App() {
     return () => window.removeEventListener('keydown', closeOnEscape)
   }, [showAdvancedSettings])
 
-  useEffect(() => {
-    void refreshAsrRuntimeStatus()
-  }, [])
-
   useEffect(
     () => () => {
-      keepListeningRef.current = false
-      speechSessionRef.current?.abort()
       stopChunkedAsr()
       clearWakeSilenceTimer()
       clearDigestTimer()
@@ -356,9 +340,6 @@ function App() {
   }
 
   function clearMeeting() {
-    keepListeningRef.current = false
-    speechSessionRef.current?.abort()
-    speechSessionRef.current = null
     stopChunkedAsr(activeMeetingIdRef.current, { flushFinal: false })
     clearWakeSilenceTimer()
     wakeCaptureRef.current = null
@@ -375,24 +356,8 @@ function App() {
     setInterimTranscript('')
     setLastVoiceTrigger(null)
     setQuestion('')
-    setSpeechStatus(speechSupport.supported ? 'idle' : 'unsupported')
+    setSpeechStatus('idle')
     setMode('paused')
-  }
-
-  async function refreshAsrRuntimeStatus() {
-    try {
-      const status = await getAsrRuntimeStatus()
-      setAsrRuntime(status)
-    } catch (error) {
-      setCaptureLog((current) => [
-        {
-          ok: false,
-          label: 'ASR runtime check failed',
-          detail: error instanceof Error ? error.message : '无法读取本地 ASR 运行状态。',
-        },
-        ...current,
-      ].slice(0, 4))
-    }
   }
 
   function addManualSegment(event: FormEvent<HTMLFormElement>) {
@@ -416,13 +381,26 @@ function App() {
       return
     }
 
+    const providerConfig = providerRef.current
+    if (!hasTextProvider(providerConfig)) {
+      setCaptureLog((current) => [
+        {
+          ok: false,
+          label: 'Agent Provider missing',
+          detail: '请先完整配置 Agent Provider 的 Base URL、Model 和 API key。',
+        },
+        ...current,
+      ].slice(0, 4))
+      return
+    }
+
     isThinkingRef.current = true
     setIsThinking(true)
     setMode('searching')
 
     const started = performance.now()
     const searches = await runAutoSearch(trimmed, contextSegments, searchConfig)
-    const draft = await generateAgentDraft({ question: trimmed, segments: contextSegments, searches, provider })
+    const draft = await generateAgentDraft({ question: trimmed, segments: contextSegments, searches, provider: providerConfig })
     const response: AgentResponse = {
       id: makeId('answer'),
       question: trimmed,
@@ -464,6 +442,21 @@ function App() {
 
   function hasTextProvider(config = providerRef.current) {
     return Boolean(config.apiKey.trim() && config.baseUrl.trim() && config.model.trim())
+  }
+
+  function hasAsrProvider(config = asrProvider) {
+    return Boolean(config.apiKey.trim() && config.baseUrl.trim() && config.model.trim())
+  }
+
+  function providerConfigurationIssues() {
+    const issues: string[] = []
+    if (!hasAsrProvider(asrProvider)) {
+      issues.push('ASR Provider')
+    }
+    if (!hasTextProvider(provider)) {
+      issues.push('Agent Provider')
+    }
+    return issues
   }
 
   function clearDigestTimer() {
@@ -733,11 +726,19 @@ function App() {
     if (asrRecordingRef.current) {
       return
     }
+    if (!hasAsrProvider(asrProvider) || !hasTextProvider(provider)) {
+      setCaptureLog((current) => [
+        {
+          ok: false,
+          label: 'Provider configuration required',
+          detail: '请先完整配置云端 ASR Provider 和 Agent Provider。',
+        },
+        ...current,
+      ].slice(0, 4))
+      return
+    }
 
     const meetingId = activeMeetingIdRef.current
-    keepListeningRef.current = false
-    speechSessionRef.current?.abort()
-    speechSessionRef.current = null
     pcmBufferRef.current = []
     pcmSampleCountRef.current = 0
     asrRecordingRef.current = true
@@ -789,13 +790,10 @@ function App() {
         {
           ok: true,
           label: 'Chunked ASR started',
-          detail: asrProvider.apiKey.trim()
-            ? `云端 ASR 优先，失败后自动切换本地 Whisper。语言：${speechLang}。`
-            : `使用本地 Whisper + Silero VAD 分段转写。语言：${speechLang}。`,
+          detail: `使用云端 ASR Provider 分段转写。语言：${speechLang}。`,
         },
         ...current,
       ].slice(0, 4))
-      await refreshAsrRuntimeStatus()
     } catch (error) {
       asrRecordingRef.current = false
       stopAudioGraph()
@@ -876,11 +874,6 @@ function App() {
   }
 
   function handleAsrResult(result: AsrTranscriptionResponse, meetingId = activeMeetingIdRef.current) {
-    setAsrRuntime((current) => ({
-      ...(current ?? { localReady: false, runtimeLabel: 'whisper.cpp + Silero VAD' }),
-      localReady: Boolean(result.localServerUrl) || current?.localReady || false,
-      localServerUrl: result.localServerUrl ?? current?.localServerUrl,
-    }))
     const text = result.text.trim()
     if (!text) {
       return
@@ -893,9 +886,9 @@ function App() {
     }
     setCaptureLog((current) => [
       {
-        ok: !result.warning,
-        label: result.usedFallback ? 'ASR fallback used' : 'ASR segment transcribed',
-        detail: result.warning ?? `${result.providerLabel} 已处理 1 段音频文本。`,
+        ok: true,
+        label: 'ASR segment transcribed',
+        detail: `${result.providerLabel} 已处理 1 段音频文本。`,
       },
       ...current,
     ].slice(0, 4))
@@ -929,125 +922,10 @@ function App() {
     pcmSampleCountRef.current = 0
   }
 
-  function startLegacySpeechRecognition() {
-    const support = getSpeechRecognitionSupport()
-    const meetingId = activeMeetingIdRef.current
-    setSpeechSupport(support)
-
-    if (!support.supported) {
-      setSpeechStatus('unsupported')
-      setCaptureLog((current) => [
-        {
-          ok: false,
-          label: support.label,
-          detail: support.detail,
-        },
-        ...current,
-      ].slice(0, 4))
-      return
-    }
-
-    speechSessionRef.current?.abort()
-    keepListeningRef.current = true
-    setSpeechStatus('listening')
-    setMode('recording')
-
-    const session = createSpeechSession({
-      lang: speechLang,
-      onStart: () => {
-        setSpeechStatus('listening')
-        setCaptureLog((current) => [
-          {
-            ok: true,
-            label: 'Mic transcription started',
-            detail: `正在使用 ${speechLang} 实时听写。`,
-          },
-          ...current,
-        ].slice(0, 4))
-      },
-      onEnd: () => {
-        setInterimTranscript('')
-        if (keepListeningRef.current) {
-          window.setTimeout(() => {
-            try {
-              speechSessionRef.current?.start()
-            } catch (error) {
-              keepListeningRef.current = false
-              setSpeechStatus('error')
-              setCaptureLog((current) => [
-                {
-                  ok: false,
-                  label: 'Mic transcription restart failed',
-                  detail: error instanceof Error ? error.message : '无法重新启动实时听写。',
-                },
-                ...current,
-              ].slice(0, 4))
-            }
-          }, 350)
-          return
-        }
-
-        setSpeechStatus(speechSupport.supported ? 'idle' : 'unsupported')
-      },
-      onInterim: (text) => {
-        if (meetingId === activeMeetingIdRef.current) {
-          setInterimTranscript(text)
-        }
-      },
-      onFinal: (text, confidence) => handleFinalTranscript(meetingId, text, confidence),
-      onError: (message) => {
-        setSpeechStatus('error')
-        setCaptureLog((current) => [
-          {
-            ok: false,
-            label: 'Mic transcription error',
-            detail: message,
-          },
-          ...current,
-        ].slice(0, 4))
-
-        if (/not-allowed|permission|service-not-allowed/i.test(message)) {
-          keepListeningRef.current = false
-        }
-      },
-    })
-
-    if (!session) {
-      setSpeechStatus('unsupported')
-      return
-    }
-
-    speechSessionRef.current = session
-
-    try {
-      session.start()
-    } catch (error) {
-      keepListeningRef.current = false
-      setSpeechStatus('error')
-      setCaptureLog((current) => [
-        {
-          ok: false,
-          label: 'Mic transcription start failed',
-          detail: error instanceof Error ? error.message : '无法启动实时听写。',
-        },
-        ...current,
-      ].slice(0, 4))
-    }
-  }
-
-  function stopLegacySpeechRecognition() {
-    keepListeningRef.current = false
-    setSpeechStatus('stopping')
-    setInterimTranscript('')
-    speechSessionRef.current?.stop()
-  }
-
   function stopActiveTranscription() {
     const meetingId = activeMeetingIdRef.current
     if (asrRecordingRef.current) {
       stopChunkedAsr(meetingId)
-    } else if (speechStatus === 'listening') {
-      stopLegacySpeechRecognition()
     } else {
       setSpeechStatus('idle')
     }
@@ -1057,18 +935,6 @@ function App() {
       archiveActiveMeeting(meetingId)
     }
     resetActiveMeeting('paused')
-  }
-
-  function handleFinalTranscript(meetingId: string, text: string, confidence: number) {
-    if (!text.trim()) {
-      return
-    }
-
-    if (meetingId === activeMeetingIdRef.current) {
-      handleRecognizedTranscript(text, confidence, 'Me', 'microphone')
-    } else {
-      appendHistoricalTranscriptSegment(meetingId, text, confidence, 'Me', 'microphone')
-    }
   }
 
   function appendHistoricalTranscriptSegment(
@@ -1152,8 +1018,10 @@ function App() {
         : '已记录原始转写。配置 Agent Provider 的文字模型后，将在这里生成递增会议纪要。'
   const digestMeta = digestStatusLabel(digestStatus, meetingDigest)
   const activeMeetingTitle = makeMeetingTitle(meetingDigest, segments, activeMeetingCreatedAt)
+  const configIssues = providerConfigurationIssues()
+  const providersReady = configIssues.length === 0
   const providerSummary = hasTextProvider(provider) ? `Agent ${provider.model}` : 'Agent not configured'
-  const asrSummary = asrProvider.apiKey.trim() ? `Cloud ASR ${asrProvider.model || 'configured'}` : 'Local Whisper'
+  const asrSummary = hasAsrProvider(asrProvider) ? `Cloud ASR ${asrProvider.model}` : 'ASR not configured'
   const searchSummary = `Search ${searchConfig.mode}`
 
   return (
@@ -1215,20 +1083,14 @@ function App() {
           </div>
           <div className={`speech-state ${speechStatus}`}>
             <span>{speechStatusLabel(speechStatus)}</span>
-            <small>
-              {asrProvider.apiKey.trim()
-                ? 'Cloud ASR first; local Whisper fallback.'
-                : `${asrRuntime?.runtimeLabel ?? 'Local Whisper'}${
-                    asrRuntime?.localServerUrl ? ` on ${asrRuntime.localServerUrl}` : ' ready on demand.'
-                  }`}
-            </small>
+            <small>{providersReady ? `Cloud ASR ${asrProvider.model}，会议纪要由 Agent Provider 生成。` : `缺少配置：${configIssues.join('、')}`}</small>
           </div>
           <div className="voice-actions">
             <button
               type="button"
               className="icon-command primary"
               onClick={startChunkedAsr}
-              disabled={speechStatus === 'listening'}
+              disabled={speechStatus === 'listening' || !providersReady}
             >
               <Mic size={18} />
               <span>{mode === 'paused' && (segments.length > 0 || meetingDigest.text) ? 'Resume mic' : 'Start mic'}</span>
@@ -1252,16 +1114,6 @@ function App() {
               <span>Stop</span>
             </button>
           </div>
-          <button
-            type="button"
-            className="icon-command"
-            onClick={startLegacySpeechRecognition}
-            disabled={speechStatus === 'listening' || !speechSupport.supported}
-            title={speechSupport.detail}
-          >
-            <Languages size={17} />
-            <span>Legacy Web Speech</span>
-          </button>
           <details className="voice-options">
             <summary>
               <span>Voice options</span>
@@ -1337,6 +1189,19 @@ function App() {
           </div>
         </header>
 
+        {!providersReady ? (
+          <section className="config-alert">
+            <div>
+              <strong>需要先完成云端配置</strong>
+              <p>请填写 {configIssues.join('、')} 的 Base URL、Model 和 API key。API key 只在本次运行中使用，重启后需要重新填写。</p>
+            </div>
+            <button type="button" className="icon-command primary" onClick={() => setShowAdvancedSettings(true)}>
+              <Settings size={17} />
+              <span>Open settings</span>
+            </button>
+          </section>
+        ) : null}
+
         <section className="metrics">
           <Metric icon={Clock} label="Duration" value={formatDuration(durationMs)} />
           <Metric icon={FileText} label="Raw segments" value={segments.length.toString()} />
@@ -1393,7 +1258,7 @@ function App() {
               {segments.length === 0 ? (
                 <div className="empty-timeline">
                   <Mic size={24} />
-                  <p>点击 Start mic 开始记录，或手动添加一段测试文本。</p>
+                  <p>完成云端配置后点击 Start mic 开始记录，或手动添加一段测试文本。</p>
                 </div>
               ) : (
                 segments
@@ -1455,9 +1320,9 @@ function App() {
             value={question}
             onChange={(event) => setQuestion(event.target.value)}
             rows={5}
-            placeholder="输入问题，或说：嗨助手 总结刚才内容"
+            placeholder={hasTextProvider(provider) ? '输入问题，或说：嗨助手 总结刚才内容' : '先配置 Agent Provider 后再提问'}
           />
-          <button type="submit" className="send-button" disabled={isThinking || !question.trim()}>
+          <button type="submit" className="send-button" disabled={isThinking || !question.trim() || !hasTextProvider(provider)}>
             {isThinking ? <Loader2 size={18} className="spin" /> : <Send size={18} />}
             <span>{isThinking ? 'Thinking' : 'Ask'}</span>
           </button>
@@ -1558,7 +1423,7 @@ function App() {
                   <input
                     value={asrProvider.baseUrl}
                     onChange={(event) => setAsrProvider((current) => ({ ...current, baseUrl: event.target.value }))}
-                    placeholder="leave empty for local Whisper"
+                    placeholder="https://api.openai.com/v1"
                   />
                 </label>
                 <label>
@@ -1578,10 +1443,6 @@ function App() {
                     placeholder="kept in memory"
                   />
                 </label>
-                <button type="button" className="icon-command" onClick={refreshAsrRuntimeStatus}>
-                  <Activity size={17} />
-                  <span>Check local ASR</span>
-                </button>
               </div>
 
               <div className="settings-group">
@@ -1834,16 +1695,12 @@ function digestStatusLabel(status: DigestStatus, digest: MeetingDigest): string 
   return 'Waiting for transcript'
 }
 
-function speechStatusLabel(status: SpeechRecognitionStatus): string {
+function speechStatusLabel(status: TranscriptionStatus): string {
   switch (status) {
     case 'listening':
       return 'Listening'
-    case 'stopping':
-      return 'Stopping'
     case 'error':
       return 'Error'
-    case 'unsupported':
-      return 'Unsupported'
     case 'idle':
     default:
       return 'Idle'

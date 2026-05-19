@@ -31,3 +31,7 @@ A text-level trigger such as `嗨助手`, `嘿助手`, `助手`, or `hey assista
 ## Assistant Command Capture
 
 The temporary state after a wake phrase is detected. Transcript after the wake phrase is treated as an instruction for the Copilot until a silence window ends the capture. Captured commands are not part of the Meeting Digest. Stop and Pause cancel unfinished Assistant Command Capture, but Finalization still preserves the meeting content before the wake phrase.
+
+## Release Provider Policy
+
+The release build requires a configured cloud ASR Provider for transcription and a configured Agent Provider for Meeting Digest and Copilot work. API keys are kept in memory only. Local ASR models are not exposed or used as fallback in the release build.

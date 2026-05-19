@@ -34,15 +34,15 @@ export async function generateAgentDraft(params: {
   searches: SearchTrace[]
   provider: ProviderConfig
 }): Promise<AgentDraft> {
-  const fallback = buildLocalDraft(params.question, params.segments, params.searches)
+  const evidence = collectEvidence(params.question, params.segments, params.searches)
 
   if (!params.provider.apiKey.trim() || !params.provider.baseUrl.trim() || !params.provider.model.trim()) {
     return {
       answer: '还没有配置会议问答模型。请填写 Provider 的 Base URL、Model 和 API key 后再提问。',
       planItems: [],
-      evidence: fallback.evidence,
+      evidence,
       providerLabel: 'provider not configured',
-      error: '未配置 OpenAI-compatible 文本模型，本次没有生成硬编码草稿。',
+      error: '未配置 OpenAI-compatible 文本模型，本次没有生成回答。',
     }
   }
 
@@ -52,16 +52,16 @@ export async function generateAgentDraft(params: {
     const parsed = parseProviderPayload(text)
 
     return {
-      answer: parsed.answer || text || fallback.answer,
-      planItems: parsed.planItems ?? parsed.plan_items ?? fallback.planItems,
-      evidence: fallback.evidence,
+      answer: parsed.answer || text || '模型没有返回可用回答。',
+      planItems: parsed.planItems ?? parsed.plan_items ?? [],
+      evidence,
       providerLabel: `${params.provider.model} via ${params.provider.endpointFlavor}`,
     }
   } catch (error) {
     return {
       answer: '会议问答模型调用失败。请检查 Provider 配置、网络或模型服务状态后重试。',
       planItems: [],
-      evidence: fallback.evidence,
+      evidence,
       providerLabel: 'provider error',
       error: error instanceof Error ? error.message : 'Unknown provider error',
     }
@@ -220,8 +220,8 @@ function parseProviderPayload(text: string): ProviderPayload {
   }
 }
 
-function buildLocalDraft(question: string, segments: MeetingSegment[], searches: SearchTrace[]): AgentDraft {
-  const evidence = [
+function collectEvidence(question: string, segments: MeetingSegment[], searches: SearchTrace[]): Evidence[] {
+  return [
     ...rankEvidence(question, segments, 4),
     ...searches.flatMap((trace) =>
       trace.sources.slice(0, 2).map((source) => ({
@@ -233,33 +233,4 @@ function buildLocalDraft(question: string, segments: MeetingSegment[], searches:
       })),
     ),
   ]
-
-  const recentFacts = evidence
-    .filter((item) => item.kind === 'meeting')
-    .slice(0, 3)
-    .map((item) => item.detail)
-
-  const searchStatus =
-    searches.length === 0
-      ? '本次没有外部搜索。'
-      : searches.every((trace) => trace.status === 'planned')
-        ? '已生成自动搜索 query，但还没有配置搜索 API endpoint。'
-        : `已记录 ${searches.length} 条搜索轨迹。`
-
-  return {
-    answer: [
-      `基于已记录会议，"${question}" 可以先按低风险原型验证，而不是直接做完整产品化。`,
-      recentFacts.length > 0 ? `会议依据：${recentFacts.join(' ')}` : '会议依据还不足，需要继续记录更多上下文。',
-      searchStatus,
-      '推断：当前最值得优先验证的是会中上下文问答是否真的能减少参会者回忆和整理成本。',
-    ].join('\n\n'),
-    planItems: [
-      '锁定一个 30-60 分钟中英混合会议样本，持续写入 transcript segment。',
-      '用快捷键触发一次会中提问，检查回答是否引用到正确的最近片段。',
-      '记录自动搜索 query 和来源，确认敏感信息是否需要脱敏。',
-      '会后删除本地会议记录，验证数据保留策略可执行。',
-    ],
-    evidence,
-    providerLabel: 'local deterministic draft',
-  }
 }

@@ -1,13 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
-import type { AsrProviderConfig, AsrRuntimeStatus, AsrTranscriptionResponse } from '../types'
-
-export async function getAsrRuntimeStatus(): Promise<AsrRuntimeStatus> {
-  if (!isTauriRuntime()) {
-    return { localReady: false, runtimeLabel: 'whisper.cpp + Silero VAD' }
-  }
-
-  return invoke<AsrRuntimeStatus>('asr_runtime_status')
-}
+import type { AsrProviderConfig, AsrTranscriptionResponse } from '../types'
 
 export async function transcribeAudioChunk(params: {
   audio: Blob
@@ -15,7 +7,7 @@ export async function transcribeAudioChunk(params: {
   language: string
 }): Promise<AsrTranscriptionResponse> {
   if (!isTauriRuntime()) {
-    throw new Error('本地/云端 ASR 转写需要在 Tauri 桌面版中运行。')
+    throw new Error('云端 ASR 转写需要在 Tauri 桌面版中运行。')
   }
 
   const audioBase64 = await blobToBase64(params.audio)

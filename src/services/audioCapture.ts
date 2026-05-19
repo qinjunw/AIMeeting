@@ -10,7 +10,7 @@ export async function probeMicrophone(): Promise<CaptureProbe> {
     return {
       ok: true,
       label,
-      detail: '麦克风权限可用。实时听写会使用浏览器/WebView 的 SpeechRecognition 能力。',
+      detail: '麦克风权限可用。实时转写会使用已配置的云端 ASR Provider。',
     }
   } catch (error) {
     return {

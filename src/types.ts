@@ -55,21 +55,9 @@ export type AsrProviderConfig = {
   model: string
 }
 
-export type AsrRuntimeStatus = {
-  whisperServerPath?: string
-  modelPath?: string
-  vadModelPath?: string
-  localServerUrl?: string
-  localReady: boolean
-  runtimeLabel: string
-}
-
 export type AsrTranscriptionResponse = {
   text: string
   providerLabel: string
-  usedFallback: boolean
-  warning?: string
-  localServerUrl?: string
 }
 
 export type SearchMode = 'auto' | 'confirm' | 'off'
@@ -124,13 +112,7 @@ export type CaptureProbe = {
   detail: string
 }
 
-export type SpeechRecognitionSupport = {
-  supported: boolean
-  label: string
-  detail: string
-}
-
-export type SpeechRecognitionStatus = 'idle' | 'listening' | 'stopping' | 'error' | 'unsupported'
+export type TranscriptionStatus = 'idle' | 'listening' | 'error'
 
 export type VoiceTrigger = {
   phrase: string
