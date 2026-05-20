@@ -60,6 +60,25 @@ export type AsrTranscriptionResponse = {
   providerLabel: string
 }
 
+export type StreamingAsrStatus = 'started' | 'interim' | 'final' | 'finished' | 'error'
+
+export type StreamingAsrEvent = {
+  sessionId: string
+  meetingId: string
+  recordingRunId: string
+  status: StreamingAsrStatus
+  text: string
+  beginMs: number | null
+  endMs: number | null
+  providerLabel: string
+  errorMessage?: string | null
+}
+
+export type StreamingAsrSessionResponse = {
+  sessionId: string
+  providerLabel: string
+}
+
 export type SearchMode = 'auto' | 'confirm' | 'off'
 
 export type SearchConfig = {
@@ -112,7 +131,7 @@ export type CaptureProbe = {
   detail: string
 }
 
-export type TranscriptionStatus = 'idle' | 'listening' | 'error'
+export type TranscriptionStatus = 'idle' | 'connecting' | 'listening' | 'finalizing' | 'error'
 
 export type VoiceTrigger = {
   phrase: string

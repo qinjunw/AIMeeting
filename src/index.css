@@ -643,6 +643,12 @@ h3 {
   background: rgba(22, 121, 91, 0.08);
 }
 
+.speech-state.connecting,
+.speech-state.finalizing {
+  border-color: rgba(34, 95, 212, 0.34);
+  background: rgba(34, 95, 212, 0.07);
+}
+
 .speech-state.error {
   border-color: rgba(186, 58, 50, 0.35);
   background: rgba(186, 58, 50, 0.07);

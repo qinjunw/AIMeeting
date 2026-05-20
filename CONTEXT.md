@@ -2,7 +2,23 @@
 
 ## Raw ASR Segment
 
-A short, timestamped transcription fragment produced by the ASR pipeline. It is useful for debugging and evidence lookup, but it is not the primary user-facing meeting record.
+A short, timestamped final transcription fragment produced by the ASR pipeline. It is useful for debugging and evidence lookup, but it is not the primary user-facing meeting record. Interim ASR text is not a Raw ASR Segment.
+
+## Streaming ASR Session
+
+A provider-backed live speech-to-text connection for one Recording Run. It owns temporary audio flow and recognition events, but final transcript ownership still belongs to the Meeting.
+
+## Interim ASR Result
+
+Mutable live recognition text produced before the ASR provider confirms a final segment. It may be replaced by later ASR events and is only suitable for live caption display.
+
+## Final ASR Result
+
+Provider-confirmed transcript text that can be converted into a Raw ASR Segment and used as Meeting Digest input.
+
+## Live Caption
+
+The current on-screen text shown from Interim ASR Results while a Recording Run is active. It is not meeting memory and must not be archived as a Raw ASR Segment.
 
 ## Meeting Digest
 

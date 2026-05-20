@@ -30,14 +30,19 @@ import {
 import { formatClock, formatDuration, makeId } from './lib/time'
 import { loadJson, saveJson } from './lib/storage'
 import { probeMicrophone, probeSystemAudio } from './services/audioCapture'
-import { transcribeAudioChunk } from './services/asrTranscription'
+import {
+  cancelStreamingAsrSession,
+  finishStreamingAsrSession,
+  listenStreamingAsrEvents,
+  pushStreamingAsrAudio,
+  startStreamingAsrSession,
+} from './services/asrTranscription'
 import { normalizeTranscriptText } from './services/chineseText'
 import { generateAgentDraft, generateMeetingDigest } from './services/modelProvider'
 import { runAutoSearch } from './services/searchTool'
 import type {
   AgentResponse,
   AsrProviderConfig,
-  AsrTranscriptionResponse,
   AudioSource,
   CaptureProbe,
   MeetingDigest,
@@ -47,6 +52,7 @@ import type {
   ProviderConfig,
   SearchConfig,
   SearchTrace,
+  StreamingAsrEvent,
   TranscriptionStatus,
   VoiceTrigger,
 } from './types'
@@ -72,9 +78,9 @@ const defaultProvider: ProviderConfig = {
 }
 
 const defaultAsrProvider: AsrProviderConfig = {
-  baseUrl: 'https://api.openai.com/v1',
+  baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
   apiKey: '',
-  model: 'whisper-1',
+  model: 'paraformer-realtime-v2',
 }
 
 const defaultSearch: SearchConfig = {
@@ -92,15 +98,11 @@ const modeMeta: Record<MeetingMode, { label: string; tone: string }> = {
 
 const speakerOptions = ['Speaker A', 'Speaker B', 'Speaker C', 'Me']
 const sourceOptions: AudioSource[] = ['system', 'microphone', 'mixed']
-const asrChunkSeconds = 1.25
-const maxAsrInFlight = 2
+const streamingSampleRate = 16000
+const streamingFrameMs = 100
+const streamingRemainderMinMs = 30
 const wakeSilenceMs = 4000
 const digestUpdateMs = 1200
-const speechRmsThreshold = 0.006
-const speechPeakThreshold = 0.02
-const speechFrameMs = 30
-const minSpeechMs = 180
-const speechFrameRatioThreshold = 0.08
 
 const emptyDigest: MeetingDigest = {
   text: '',
@@ -117,35 +119,25 @@ type AsrActivity = {
   lastLatencyMs: number
 }
 
-type AsrChunkJob = {
-  sequence: number
-  audio: Blob
-  provider: AsrProviderConfig
-  language: string
-  enqueuedAt: number
-}
-
-type AsrChunkOutcome = {
-  result?: AsrTranscriptionResponse
-  error?: unknown
-  latencyMs: number
-}
-
-type AsrChunkState = {
-  queue: AsrChunkJob[]
-  inFlight: number
-  nextSequence: number
-  nextCommitSequence: number
-  outcomes: Map<number, AsrChunkOutcome>
-  lastLatencyMs: number
-  idleResolvers: Array<() => void>
-}
-
 type WakeCapture = {
   phrase: string
   transcript: string
   parts: string[]
   startedAt: string
+}
+
+type StreamingAsrSessionInfo = {
+  sessionId: string
+  meetingId: string
+  recordingRunId: string
+  providerLabel: string
+  startedAt: number
+  pendingFrames: number
+  droppedFrames: number
+  lastLatencyMs: number
+  firstInterimAt?: number
+  firstFinalAt?: number
+  pushErrorReported?: boolean
 }
 
 type WindowWithAudioContext = Window & {
@@ -206,8 +198,13 @@ function App() {
   const pcmBufferRef = useRef<Float32Array[]>([])
   const pcmSampleCountRef = useRef(0)
   const asrRecordingRef = useRef(false)
-  const asrChunkStatesRef = useRef<Map<string, AsrChunkState>>(new Map())
+  const streamingSessionsRef = useRef<Map<string, StreamingAsrSessionInfo>>(new Map())
+  const currentStreamingSessionIdRef = useRef<string | null>(null)
+  const streamingStartTokenRef = useRef(0)
+  const streamingAudioPushChainsRef = useRef<Map<string, Promise<void>>>(new Map())
   const asrPendingCountRef = useRef<Map<string, number>>(new Map())
+  const asrIdleResolversRef = useRef<Map<string, Array<() => void>>>(new Map())
+  const streamingEventHandlerRef = useRef<(event: StreamingAsrEvent) => void>(() => undefined)
   const wakeCaptureRef = useRef<WakeCapture | null>(null)
   const wakeSilenceTimerRef = useRef<number | null>(null)
   const digestTimerRef = useRef<number | null>(null)
@@ -293,6 +290,43 @@ function App() {
   }, [autoAskOnWake])
 
   useEffect(() => {
+    streamingEventHandlerRef.current = handleStreamingAsrEvent
+  })
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined
+    let disposed = false
+
+    try {
+      listenStreamingAsrEvents((event) => streamingEventHandlerRef.current(event))
+        .then((nextUnlisten) => {
+          if (disposed) {
+            nextUnlisten()
+            return
+          }
+          unlisten = nextUnlisten
+        })
+        .catch((error) => {
+          setCaptureLog((current) => [
+            {
+              ok: false,
+              label: 'Streaming ASR listener failed',
+              detail: error instanceof Error ? error.message : '无法监听实时 ASR 事件。',
+            },
+            ...current,
+          ].slice(0, 4))
+        })
+    } catch {
+      return
+    }
+
+    return () => {
+      disposed = true
+      unlisten?.()
+    }
+  }, [])
+
+  useEffect(() => {
     if (!showAdvancedSettings) {
       return
     }
@@ -309,7 +343,7 @@ function App() {
 
   useEffect(
     () => () => {
-      stopChunkedAsr()
+      cancelCurrentStreamingAsr()
       clearWakeSilenceTimer()
       clearDigestTimer()
     },
@@ -385,6 +419,7 @@ function App() {
     setLastVoiceTrigger(null)
     setQuestion('')
     setMode(nextMode)
+    setSpeechStatus('idle')
     setAsrActivity({ queued: 0, inFlight: 0, lastLatencyMs: 0 })
   }
 
@@ -415,19 +450,19 @@ function App() {
 
   function pauseActiveMeeting() {
     const meetingId = activeMeetingIdRef.current
-    stopChunkedAsr(meetingId)
+    stopStreamingAsr(meetingId)
     cancelWakeCapture()
     setQuestion('')
     setMode('paused')
   }
 
   function clearMeeting() {
-    stopChunkedAsr(activeMeetingIdRef.current, { flushFinal: false })
+    stopStreamingAsr(activeMeetingIdRef.current, { flushFinal: false })
     clearWakeSilenceTimer()
     wakeCaptureRef.current = null
     clearDigestTimer()
     asrPendingCountRef.current.delete(activeMeetingIdRef.current)
-    asrChunkStatesRef.current.delete(activeMeetingIdRef.current)
+    asrIdleResolversRef.current.delete(activeMeetingIdRef.current)
     meetingDigestRef.current = emptyDigest
     segmentsRef.current = []
     responsesRef.current = []
@@ -815,8 +850,8 @@ function App() {
     return nextSegments
   }
 
-  async function startChunkedAsr() {
-    if (asrRecordingRef.current) {
+  async function startStreamingAsr() {
+    if (asrRecordingRef.current || speechStatus === 'connecting' || speechStatus === 'finalizing') {
       return
     }
     if (!hasAsrProvider(asrProvider) || !hasTextProvider(provider)) {
@@ -832,15 +867,52 @@ function App() {
     }
 
     const meetingId = activeMeetingIdRef.current
+    const recordingRunId = makeId('run')
+    const startToken = streamingStartTokenRef.current + 1
+    streamingStartTokenRef.current = startToken
+    let startedSessionId: string | null = null
     pcmBufferRef.current = []
     pcmSampleCountRef.current = 0
-    asrRecordingRef.current = true
-    setSpeechStatus('listening')
+    setSpeechStatus('connecting')
     setMode('recording')
-    setInterimTranscript(`正在采集音频，约每 ${asrChunkSeconds} 秒转写一次。`)
+    setInterimTranscript('正在连接 DashScope 实时 ASR...')
 
     try {
+      const session = await startStreamingAsrSession({
+        provider: asrProvider,
+        language: speechLang,
+        meetingId,
+        recordingRunId,
+      })
+      startedSessionId = session.sessionId
+      if (streamingStartTokenRef.current !== startToken) {
+        await cancelStreamingAsrSession(session.sessionId)
+        return
+      }
+      const sessionInfo: StreamingAsrSessionInfo = {
+        sessionId: session.sessionId,
+        meetingId,
+        recordingRunId,
+        providerLabel: session.providerLabel,
+        startedAt: performance.now(),
+        pendingFrames: 0,
+        droppedFrames: 0,
+        lastLatencyMs: 0,
+      }
+      streamingSessionsRef.current.set(session.sessionId, sessionInfo)
+      currentStreamingSessionIdRef.current = session.sessionId
+      incrementAsrPending(meetingId)
+
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      if (streamingStartTokenRef.current !== startToken) {
+        stream.getTracks().forEach((track) => track.stop())
+        streamingSessionsRef.current.delete(session.sessionId)
+        streamingAudioPushChainsRef.current.delete(session.sessionId)
+        currentStreamingSessionIdRef.current = null
+        decrementAsrPending(meetingId)
+        await cancelStreamingAsrSession(session.sessionId)
+        return
+      }
       const AudioContextCtor = window.AudioContext || (window as WindowWithAudioContext).webkitAudioContext
       if (!AudioContextCtor) {
         throw new Error('当前 WebView/浏览器不支持 AudioContext。')
@@ -848,7 +920,7 @@ function App() {
       const audioContext = new AudioContextCtor()
       const source = audioContext.createMediaStreamSource(stream)
       const processor = audioContext.createScriptProcessor(4096, 1, 1)
-      const chunkSamples = audioContext.sampleRate * asrChunkSeconds
+      const frameSourceSamples = Math.max(1, Math.round((audioContext.sampleRate * streamingFrameMs) / 1000))
 
       processor.onaudioprocess = (event) => {
         const output = event.outputBuffer.getChannelData(0)
@@ -864,11 +936,9 @@ function App() {
         pcmBufferRef.current.push(copy)
         pcmSampleCountRef.current += copy.length
 
-        if (pcmSampleCountRef.current >= chunkSamples) {
-          const audio = flushWavChunk(audioContext.sampleRate)
-          if (audio) {
-            enqueueAsrChunk(audio, meetingId)
-          }
+        while (pcmSampleCountRef.current >= frameSourceSamples) {
+          const frame = consumeSamples(frameSourceSamples)
+          queueStreamingAudioFrame(session.sessionId, frame, audioContext.sampleRate)
         }
       }
 
@@ -878,255 +948,340 @@ function App() {
       audioContextRef.current = audioContext
       audioSourceRef.current = source
       audioProcessorRef.current = processor
+      asrRecordingRef.current = true
+      setSpeechStatus('listening')
+      setInterimTranscript('实时 ASR 已连接，正在等待语音。')
+      syncStreamingAsrActivity()
 
       setCaptureLog((current) => [
         {
           ok: true,
-          label: 'Chunked ASR started',
-          detail: `使用云端 ASR Provider 分段转写。语言：${speechLang}。`,
+          label: 'Streaming ASR started',
+          detail: `${session.providerLabel} 已连接。音频格式：16kHz mono PCM16，${streamingFrameMs} ms/frame。`,
         },
         ...current,
       ].slice(0, 4))
     } catch (error) {
       asrRecordingRef.current = false
       stopAudioGraph()
+      if (startedSessionId) {
+        currentStreamingSessionIdRef.current = null
+        streamingSessionsRef.current.delete(startedSessionId)
+        streamingAudioPushChainsRef.current.delete(startedSessionId)
+        decrementAsrPending(meetingId)
+        void cancelStreamingAsrSession(startedSessionId)
+      }
       setSpeechStatus('error')
       setInterimTranscript('')
       setCaptureLog((current) => [
         {
           ok: false,
-          label: 'Chunked ASR start failed',
-          detail: error instanceof Error ? error.message : '无法启动分段 ASR。',
+          label: 'Streaming ASR start failed',
+          detail: error instanceof Error ? error.message : '无法启动实时 ASR。',
         },
         ...current,
       ].slice(0, 4))
     }
   }
 
-  function stopChunkedAsr(
+  function stopStreamingAsr(
     meetingId = activeMeetingIdRef.current,
     options: { flushFinal?: boolean } = { flushFinal: true },
   ) {
-    const wasRecording = asrRecordingRef.current
-    const sampleRate = audioContextRef.current?.sampleRate ?? 16000
+    streamingStartTokenRef.current += 1
+    const sessionId = currentStreamingSessionIdRef.current
+    const session = sessionId ? streamingSessionsRef.current.get(sessionId) : null
+    const sampleRate = audioContextRef.current?.sampleRate ?? streamingSampleRate
+    const targetMeetingId = session?.meetingId ?? meetingId
     asrRecordingRef.current = false
+    currentStreamingSessionIdRef.current = null
 
-    if (wasRecording && options.flushFinal !== false) {
-      const audio = flushWavChunk(sampleRate)
-      if (audio) {
-        enqueueAsrChunk(audio, meetingId)
-      }
+    if (session && options.flushFinal !== false) {
+      flushStreamingAudioRemainder(session.sessionId, sampleRate)
     }
 
     stopAudioGraph()
-    if ((asrPendingCountRef.current.get(meetingId) ?? 0) === 0) {
+
+    if (!session) {
+      setSpeechStatus('idle')
+      if ((asrPendingCountRef.current.get(targetMeetingId) ?? 0) === 0) {
+        setInterimTranscript('')
+      }
+      syncStreamingAsrActivity()
+      return
+    }
+
+    if (options.flushFinal === false) {
+      streamingSessionsRef.current.delete(session.sessionId)
+      streamingAudioPushChainsRef.current.delete(session.sessionId)
+      decrementAsrPending(session.meetingId)
+      void cancelStreamingAsrSession(session.sessionId)
+      setSpeechStatus('idle')
       setInterimTranscript('')
-    }
-    setSpeechStatus('idle')
-  }
-
-  function enqueueAsrChunk(audio: Blob, meetingId = activeMeetingIdRef.current) {
-    const state = getAsrChunkState(meetingId)
-    const job: AsrChunkJob = {
-      sequence: state.nextSequence,
-      audio,
-      provider: asrProvider,
-      language: speechLang,
-      enqueuedAt: performance.now(),
+      syncStreamingAsrActivity()
+      return
     }
 
-    state.nextSequence += 1
-    state.queue.push(job)
-    syncAsrActivity(meetingId)
-    pumpAsrQueue(meetingId)
-  }
-
-  function getAsrChunkState(meetingId: string): AsrChunkState {
-    const current = asrChunkStatesRef.current.get(meetingId)
-    if (current) {
-      return current
+    if (session.meetingId === activeMeetingIdRef.current) {
+      setSpeechStatus('finalizing')
+      setInterimTranscript('正在结束实时 ASR，等待 final 结果。')
     }
-
-    const nextState: AsrChunkState = {
-      queue: [],
-      inFlight: 0,
-      nextSequence: 0,
-      nextCommitSequence: 0,
-      outcomes: new Map(),
-      lastLatencyMs: 0,
-      idleResolvers: [],
-    }
-    asrChunkStatesRef.current.set(meetingId, nextState)
-    return nextState
-  }
-
-  function pumpAsrQueue(meetingId: string) {
-    const state = getAsrChunkState(meetingId)
-
-    while (state.inFlight < maxAsrInFlight && state.queue.length > 0) {
-      const job = state.queue.shift()
-      if (!job) {
-        return
-      }
-
-      state.inFlight += 1
-      syncAsrActivity(meetingId)
-
-      void transcribeAudioChunk({ audio: job.audio, provider: job.provider, language: job.language })
-        .then((result) => {
-          state.outcomes.set(job.sequence, {
-            result,
-            latencyMs: Math.round(performance.now() - job.enqueuedAt),
-          })
-        })
-        .catch((error) => {
-          state.outcomes.set(job.sequence, {
-            error,
-            latencyMs: Math.round(performance.now() - job.enqueuedAt),
-          })
-        })
-        .finally(() => {
-          state.inFlight = Math.max(0, state.inFlight - 1)
-          commitReadyAsrOutcomes(meetingId)
-          pumpAsrQueue(meetingId)
-          syncAsrActivity(meetingId)
-          resolveAsrIdleIfDone(meetingId)
-        })
-    }
-  }
-
-  function commitReadyAsrOutcomes(meetingId: string) {
-    const state = getAsrChunkState(meetingId)
-
-    while (state.outcomes.has(state.nextCommitSequence)) {
-      const outcome = state.outcomes.get(state.nextCommitSequence)
-      state.outcomes.delete(state.nextCommitSequence)
-      state.nextCommitSequence += 1
-
-      if (!outcome) {
-        continue
-      }
-
-      state.lastLatencyMs = outcome.latencyMs
-      if (outcome.result) {
-        handleAsrResult(outcome.result, meetingId, outcome.latencyMs)
-      } else {
-        handleAsrError(outcome.error, meetingId)
-      }
-    }
-  }
-
-  function handleAsrError(error: unknown, meetingId: string) {
-    if (meetingId === activeMeetingIdRef.current) {
-      setSpeechStatus('error')
-    } else {
-      updateHistoricalMeeting(meetingId, (meeting) => ({
-        ...meeting,
-        status: 'error',
-        error: error instanceof Error ? error.message : '音频转写失败。',
-        updatedAt: new Date().toISOString(),
-      }))
-    }
-    setCaptureLog((current) => [
-      {
-        ok: false,
-        label: 'ASR transcription failed',
-        detail: error instanceof Error ? error.message : '音频转写失败。',
-      },
-      ...current,
-    ].slice(0, 4))
+    void finishStreamingSessionAfterQueuedAudio(session.sessionId).catch((error) => {
+      handleStreamingAsrFailure(session.sessionId, error instanceof Error ? error.message : '实时 ASR finish-task 发送失败。')
+    })
   }
 
   function waitForAsrIdle(meetingId: string): Promise<void> {
-    const state = asrChunkStatesRef.current.get(meetingId)
-    if (!state || isAsrStateIdle(state)) {
+    if ((asrPendingCountRef.current.get(meetingId) ?? 0) === 0) {
       return Promise.resolve()
     }
 
     return new Promise((resolve) => {
-      state.idleResolvers.push(resolve)
+      const resolvers = asrIdleResolversRef.current.get(meetingId) ?? []
+      resolvers.push(resolve)
+      asrIdleResolversRef.current.set(meetingId, resolvers)
     })
   }
 
   function resolveAsrIdleIfDone(meetingId: string) {
-    const state = asrChunkStatesRef.current.get(meetingId)
-    if (!state || !isAsrStateIdle(state)) {
+    if ((asrPendingCountRef.current.get(meetingId) ?? 0) > 0) {
       return
     }
 
-    const resolvers = state.idleResolvers.splice(0)
+    const resolvers = asrIdleResolversRef.current.get(meetingId) ?? []
+    asrIdleResolversRef.current.delete(meetingId)
     for (const resolve of resolvers) {
       resolve()
     }
   }
 
-  function isAsrStateIdle(state: AsrChunkState) {
-    return state.queue.length === 0 && state.inFlight === 0 && state.outcomes.size === 0
+  function incrementAsrPending(meetingId: string) {
+    asrPendingCountRef.current.set(meetingId, (asrPendingCountRef.current.get(meetingId) ?? 0) + 1)
+    syncStreamingAsrActivity()
   }
 
-  function syncAsrActivity(meetingId: string) {
-    const state = asrChunkStatesRef.current.get(meetingId)
-    const queued = state?.queue.length ?? 0
-    const inFlight = state?.inFlight ?? 0
-    const pending = queued + inFlight + (state?.outcomes.size ?? 0)
-
-    asrPendingCountRef.current.set(meetingId, pending)
-
-    if (meetingId !== activeMeetingIdRef.current) {
-      return
-    }
-
-    setAsrActivity({
-      queued,
-      inFlight,
-      lastLatencyMs: state?.lastLatencyMs ?? 0,
-    })
-    setInterimTranscript((current) => {
-      if (pending === 0) {
-        return current.startsWith('正在转写音频') ? '' : current
-      }
-      return `正在转写音频：进行中 ${inFlight}，排队 ${queued}。`
-    })
-  }
-
-  function handleAsrResult(
-    result: AsrTranscriptionResponse,
-    meetingId = activeMeetingIdRef.current,
-    latencyMs = 0,
-  ) {
-    const text = result.text.trim()
-    if (!text) {
-      return
-    }
-
-    if (meetingId === activeMeetingIdRef.current) {
-      handleRecognizedTranscript(text, 0.88, 'Me', 'microphone')
+  function decrementAsrPending(meetingId: string) {
+    const nextCount = Math.max(0, (asrPendingCountRef.current.get(meetingId) ?? 0) - 1)
+    if (nextCount === 0) {
+      asrPendingCountRef.current.delete(meetingId)
     } else {
-      appendHistoricalTranscriptSegment(meetingId, text, 0.88, 'Me', 'microphone')
+      asrPendingCountRef.current.set(meetingId, nextCount)
+    }
+    resolveAsrIdleIfDone(meetingId)
+    syncStreamingAsrActivity()
+  }
+
+  function syncStreamingAsrActivity() {
+    const activeMeetingId = activeMeetingIdRef.current
+    const activeSessions = Array.from(streamingSessionsRef.current.values()).filter(
+      (session) => session.meetingId === activeMeetingId,
+    )
+    setAsrActivity((current) => ({
+      queued: activeSessions.reduce((sum, session) => sum + session.pendingFrames, 0),
+      inFlight: activeSessions.length,
+      lastLatencyMs: activeSessions.at(-1)?.lastLatencyMs ?? current.lastLatencyMs,
+    }))
+  }
+
+  function consumeSamples(sampleCount: number): Float32Array {
+    const targetCount = Math.min(sampleCount, pcmSampleCountRef.current)
+    const frame = new Float32Array(targetCount)
+    const nextChunks: Float32Array[] = []
+    let copied = 0
+    let remainingToCopy = targetCount
+
+    for (const chunk of pcmBufferRef.current) {
+      if (remainingToCopy <= 0) {
+        nextChunks.push(chunk)
+        continue
+      }
+
+      const take = Math.min(remainingToCopy, chunk.length)
+      frame.set(chunk.subarray(0, take), copied)
+      copied += take
+      remainingToCopy -= take
+
+      if (take < chunk.length) {
+        nextChunks.push(chunk.subarray(take))
+      }
+    }
+
+    pcmBufferRef.current = nextChunks
+    pcmSampleCountRef.current = Math.max(0, pcmSampleCountRef.current - targetCount)
+    return frame
+  }
+
+  function queueStreamingAudioFrame(sessionId: string, samples: Float32Array, inputSampleRate: number) {
+    const session = streamingSessionsRef.current.get(sessionId)
+    if (!session) {
+      return
+    }
+
+    const audioBase64 = pcm16ToBase64(resampleLinear(samples, inputSampleRate, streamingSampleRate))
+    session.pendingFrames += 1
+    syncStreamingAsrActivity()
+    const previous = streamingAudioPushChainsRef.current.get(sessionId) ?? Promise.resolve()
+    const next = previous
+      .catch(() => undefined)
+      .then(() => pushStreamingAsrAudio({ sessionId, audioBase64 }))
+      .catch((error) => {
+        const current = streamingSessionsRef.current.get(sessionId)
+        if (current && !current.pushErrorReported) {
+          current.pushErrorReported = true
+          setCaptureLog((logs) => [
+            {
+              ok: false,
+              label: 'Streaming ASR audio failed',
+              detail: error instanceof Error ? error.message : '实时 ASR 音频帧发送失败。',
+            },
+            ...logs,
+          ].slice(0, 4))
+        }
+      })
+      .finally(() => {
+        const current = streamingSessionsRef.current.get(sessionId)
+        if (current) {
+          current.pendingFrames = Math.max(0, current.pendingFrames - 1)
+          syncStreamingAsrActivity()
+        }
+      })
+
+    streamingAudioPushChainsRef.current.set(sessionId, next)
+  }
+
+  function flushStreamingAudioRemainder(sessionId: string, sampleRate: number) {
+    const minSamples = Math.max(1, Math.round((sampleRate * streamingRemainderMinMs) / 1000))
+    if (pcmSampleCountRef.current < minSamples) {
+      return
+    }
+
+    const frame = consumeSamples(pcmSampleCountRef.current)
+    queueStreamingAudioFrame(sessionId, frame, sampleRate)
+  }
+
+  async function finishStreamingSessionAfterQueuedAudio(sessionId: string) {
+    await (streamingAudioPushChainsRef.current.get(sessionId) ?? Promise.resolve())
+    await finishStreamingAsrSession(sessionId)
+  }
+
+  function cancelCurrentStreamingAsr() {
+    streamingStartTokenRef.current += 1
+    const sessionId = currentStreamingSessionIdRef.current
+    currentStreamingSessionIdRef.current = null
+    asrRecordingRef.current = false
+    stopAudioGraph()
+    if (!sessionId) {
+      return
+    }
+    const session = streamingSessionsRef.current.get(sessionId)
+    if (session) {
+      streamingSessionsRef.current.delete(sessionId)
+      streamingAudioPushChainsRef.current.delete(sessionId)
+      decrementAsrPending(session.meetingId)
+    }
+    void cancelStreamingAsrSession(sessionId)
+  }
+
+  function handleStreamingAsrEvent(event: StreamingAsrEvent) {
+    const session = streamingSessionsRef.current.get(event.sessionId)
+    if (!session) {
+      return
+    }
+
+    if (event.status === 'interim') {
+      if (event.meetingId === activeMeetingIdRef.current) {
+        if (!session.firstInterimAt) {
+          session.firstInterimAt = performance.now()
+          session.lastLatencyMs = Math.round(session.firstInterimAt - session.startedAt)
+          syncStreamingAsrActivity()
+        }
+        setInterimTranscript(event.text)
+      }
+      return
+    }
+
+    if (event.status === 'final') {
+      if (!session.firstFinalAt) {
+        session.firstFinalAt = performance.now()
+        session.lastLatencyMs = Math.round(session.firstFinalAt - session.startedAt)
+        syncStreamingAsrActivity()
+      }
+      const text = event.text.trim()
+      if (text) {
+        if (event.meetingId === activeMeetingIdRef.current) {
+          handleRecognizedTranscript(text, 0.9, 'Me', 'microphone')
+        } else {
+          appendHistoricalTranscriptSegment(event.meetingId, text, 0.9, 'Me', 'microphone')
+        }
+      }
+      return
+    }
+
+    if (event.status === 'error') {
+      handleStreamingAsrFailure(event.sessionId, event.errorMessage || '实时 ASR 连接失败。')
+      return
+    }
+
+    if (event.status === 'finished') {
+      finishStreamingAsrLocally(event.sessionId)
+    }
+  }
+
+  function handleStreamingAsrFailure(sessionId: string, message: string) {
+    const session = streamingSessionsRef.current.get(sessionId)
+    if (!session) {
+      return
+    }
+
+    if (session.meetingId === activeMeetingIdRef.current) {
+      setSpeechStatus('error')
+      setInterimTranscript('')
+    } else {
+      updateHistoricalMeeting(session.meetingId, (meeting) => ({
+        ...meeting,
+        status: 'error',
+        error: message,
+        updatedAt: new Date().toISOString(),
+      }))
+    }
+
+    setCaptureLog((current) => [
+      {
+        ok: false,
+        label: 'Streaming ASR failed',
+        detail: message,
+      },
+      ...current,
+    ].slice(0, 4))
+    finishStreamingAsrLocally(sessionId)
+  }
+
+  function finishStreamingAsrLocally(sessionId: string) {
+    const session = streamingSessionsRef.current.get(sessionId)
+    if (!session) {
+      return
+    }
+
+    streamingSessionsRef.current.delete(sessionId)
+    streamingAudioPushChainsRef.current.delete(sessionId)
+    decrementAsrPending(session.meetingId)
+
+    if (currentStreamingSessionIdRef.current === sessionId) {
+      currentStreamingSessionIdRef.current = null
+    }
+    if (session.meetingId === activeMeetingIdRef.current) {
+      setSpeechStatus('idle')
+      setInterimTranscript('')
+      setMode((current) => (current === 'recording' ? 'paused' : current))
     }
     setCaptureLog((current) => [
       {
         ok: true,
-        label: 'ASR segment transcribed',
-        detail: `${result.providerLabel} 已处理 1 段音频文本${latencyMs ? `，${latencyMs} ms` : ''}。`,
+        label: 'Streaming ASR finished',
+        detail: `${session.providerLabel} 已完成本次 Recording Run。`,
       },
       ...current,
     ].slice(0, 4))
-  }
-
-  function flushWavChunk(sampleRate: number): Blob | null {
-    const sampleCount = pcmSampleCountRef.current
-    if (sampleCount < sampleRate * 0.6) {
-      return null
-    }
-
-    const samples = mergeSamples(pcmBufferRef.current, sampleCount)
-    pcmBufferRef.current = []
-    pcmSampleCountRef.current = 0
-    if (!hasSpeechEnergy(samples, sampleRate)) {
-      return null
-    }
-    return encodeWav(samples, sampleRate)
   }
 
   function stopAudioGraph() {
@@ -1144,8 +1299,8 @@ function App() {
 
   function stopActiveTranscription() {
     const meetingId = activeMeetingIdRef.current
-    if (asrRecordingRef.current) {
-      stopChunkedAsr(meetingId)
+    if (asrRecordingRef.current || currentStreamingSessionIdRef.current || speechStatus === 'connecting') {
+      stopStreamingAsr(meetingId)
     } else {
       setSpeechStatus('idle')
     }
@@ -1246,9 +1401,9 @@ function App() {
   const asrSummary = hasAsrProvider(asrProvider) ? `Cloud ASR ${asrProvider.model}` : 'ASR not configured'
   const asrActivitySummary =
     asrActivity.queued > 0 || asrActivity.inFlight > 0
-      ? `ASR in-flight ${asrActivity.inFlight}, queued ${asrActivity.queued}.`
+      ? `Streaming sessions ${asrActivity.inFlight}, pending frames ${asrActivity.queued}.`
       : asrActivity.lastLatencyMs > 0
-        ? `Last ASR ${asrActivity.lastLatencyMs} ms.`
+        ? `First ASR ${asrActivity.lastLatencyMs} ms.`
         : 'ASR ready.'
   const searchSummary = `Search ${searchConfig.mode}`
 
@@ -1347,8 +1502,8 @@ function App() {
             <button
               type="button"
               className="icon-command primary"
-              onClick={startChunkedAsr}
-              disabled={speechStatus === 'listening' || !providersReady}
+              onClick={startStreamingAsr}
+              disabled={speechStatus === 'connecting' || speechStatus === 'listening' || speechStatus === 'finalizing' || !providersReady}
             >
               <Mic size={18} />
               <span>{mode === 'paused' && (segments.length > 0 || meetingDigest.text) ? 'Resume mic' : 'Start mic'}</span>
@@ -1366,7 +1521,7 @@ function App() {
               type="button"
               className="icon-command"
               onClick={stopActiveTranscription}
-              disabled={speechStatus !== 'listening' && segments.length === 0 && !meetingDigest.text}
+              disabled={!['connecting', 'listening', 'finalizing'].includes(speechStatus) && segments.length === 0 && !meetingDigest.text}
             >
               <Square size={17} />
               <span>Stop</span>
@@ -1681,7 +1836,7 @@ function App() {
                   <input
                     value={asrProvider.baseUrl}
                     onChange={(event) => setAsrProvider((current) => ({ ...current, baseUrl: event.target.value }))}
-                    placeholder="https://api.openai.com/v1"
+                    placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1"
                   />
                 </label>
                 <label>
@@ -1689,7 +1844,7 @@ function App() {
                   <input
                     value={asrProvider.model}
                     onChange={(event) => setAsrProvider((current) => ({ ...current, model: event.target.value }))}
-                    placeholder="whisper-1 or qwen3-asr-flash"
+                    placeholder="paraformer-realtime-v2"
                   />
                 </label>
                 <label>
@@ -1953,7 +2108,7 @@ function digestStatusLabel(
     return digest.error ? `Digest error: ${digest.error}` : 'Digest error'
   }
   if (pendingAsrChunks > 0) {
-    return `Waiting for ASR (${pendingAsrChunks} chunks)`
+    return `Waiting for ASR (${pendingAsrChunks} streaming items)`
   }
   if (digest.updatedAt) {
     return `Updated ${new Date(digest.updatedAt).toLocaleTimeString()}`
@@ -1963,8 +2118,12 @@ function digestStatusLabel(
 
 function speechStatusLabel(status: TranscriptionStatus): string {
   switch (status) {
+    case 'connecting':
+      return 'Connecting'
     case 'listening':
       return 'Listening'
+    case 'finalizing':
+      return 'Finalizing'
     case 'error':
       return 'Error'
     case 'idle':
@@ -1973,80 +2132,44 @@ function speechStatusLabel(status: TranscriptionStatus): string {
   }
 }
 
-function mergeSamples(chunks: Float32Array[], sampleCount: number): Float32Array {
-  const merged = new Float32Array(sampleCount)
-  let offset = 0
-
-  for (const chunk of chunks) {
-    merged.set(chunk, offset)
-    offset += chunk.length
+function resampleLinear(samples: Float32Array, inputSampleRate: number, outputSampleRate: number): Float32Array {
+  if (inputSampleRate === outputSampleRate) {
+    return samples
   }
 
-  return merged
+  const outputLength = Math.max(1, Math.round((samples.length * outputSampleRate) / inputSampleRate))
+  const output = new Float32Array(outputLength)
+  const ratio = (samples.length - 1) / Math.max(1, outputLength - 1)
+
+  for (let index = 0; index < outputLength; index += 1) {
+    const position = index * ratio
+    const lower = Math.floor(position)
+    const upper = Math.min(samples.length - 1, lower + 1)
+    const weight = position - lower
+    output[index] = samples[lower] * (1 - weight) + samples[upper] * weight
+  }
+
+  return output
 }
 
-function hasSpeechEnergy(samples: Float32Array, sampleRate: number): boolean {
-  const frameSize = Math.max(1, Math.round((sampleRate * speechFrameMs) / 1000))
-  const totalFrames = Math.max(1, Math.ceil(samples.length / frameSize))
-  let voicedFrames = 0
+function pcm16ToBase64(samples: Float32Array): string {
+  const bytes = new Uint8Array(samples.length * 2)
+  const view = new DataView(bytes.buffer)
 
-  for (let start = 0; start < samples.length; start += frameSize) {
-    const end = Math.min(samples.length, start + frameSize)
-    let sumSquares = 0
-    let peak = 0
-
-    for (let index = start; index < end; index += 1) {
-      const value = Math.abs(samples[index])
-      sumSquares += value * value
-      peak = Math.max(peak, value)
-    }
-
-    const rms = Math.sqrt(sumSquares / Math.max(1, end - start))
-    if (rms >= speechRmsThreshold || peak >= speechPeakThreshold) {
-      voicedFrames += 1
-    }
+  for (let index = 0; index < samples.length; index += 1) {
+    const clamped = Math.max(-1, Math.min(1, samples[index]))
+    view.setInt16(index * 2, clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff, true)
   }
 
-  const voicedMs = (voicedFrames * speechFrameMs)
-  const voicedRatio = voicedFrames / totalFrames
-  return voicedMs >= minSpeechMs || (voicedMs >= speechFrameMs * 3 && voicedRatio >= speechFrameRatioThreshold)
+  return bytesToBase64(bytes)
 }
 
-function encodeWav(samples: Float32Array, sampleRate: number): Blob {
-  const bytesPerSample = 2
-  const channels = 1
-  const dataSize = samples.length * bytesPerSample
-  const buffer = new ArrayBuffer(44 + dataSize)
-  const view = new DataView(buffer)
-
-  writeAscii(view, 0, 'RIFF')
-  view.setUint32(4, 36 + dataSize, true)
-  writeAscii(view, 8, 'WAVE')
-  writeAscii(view, 12, 'fmt ')
-  view.setUint32(16, 16, true)
-  view.setUint16(20, 1, true)
-  view.setUint16(22, channels, true)
-  view.setUint32(24, sampleRate, true)
-  view.setUint32(28, sampleRate * channels * bytesPerSample, true)
-  view.setUint16(32, channels * bytesPerSample, true)
-  view.setUint16(34, 16, true)
-  writeAscii(view, 36, 'data')
-  view.setUint32(40, dataSize, true)
-
-  let offset = 44
-  for (const sample of samples) {
-    const clamped = Math.max(-1, Math.min(1, sample))
-    view.setInt16(offset, clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff, true)
-    offset += 2
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = ''
+  for (let index = 0; index < bytes.length; index += 1) {
+    binary += String.fromCharCode(bytes[index])
   }
-
-  return new Blob([buffer], { type: 'audio/wav' })
-}
-
-function writeAscii(view: DataView, offset: number, value: string) {
-  for (let index = 0; index < value.length; index += 1) {
-    view.setUint8(offset + index, value.charCodeAt(index))
-  }
+  return window.btoa(binary)
 }
 
 export default App

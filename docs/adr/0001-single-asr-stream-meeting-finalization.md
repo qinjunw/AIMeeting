@@ -16,7 +16,7 @@ Running separate microphone or ASR pipelines for meeting notes and wake capture 
 
 ## Decision
 
-Use one ASR text stream and dispatch recognized text to Meeting Digest and Assistant Command Capture consumers. Every async ASR, digest, and Copilot result carries a Meeting id. Late results update their owning Meeting only.
+Use one ASR text stream and dispatch final recognized text to Meeting Digest and Assistant Command Capture consumers. Interim ASR text may be displayed as a Live Caption, but it is not meeting memory. Every async ASR, digest, and Copilot result carries a Meeting id. Late results update their owning Meeting only.
 
 Stop archives the active Meeting and starts a fresh Meeting boundary. Pause stops the current Recording Run but keeps the Meeting active.
 

@@ -1,5 +1,11 @@
 import { invoke } from '@tauri-apps/api/core'
-import type { AsrProviderConfig, AsrTranscriptionResponse } from '../types'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import type {
+  AsrProviderConfig,
+  AsrTranscriptionResponse,
+  StreamingAsrEvent,
+  StreamingAsrSessionResponse,
+} from '../types'
 
 export async function transcribeAudioChunk(params: {
   audio: Blob
@@ -24,6 +30,63 @@ export async function transcribeAudioChunk(params: {
   })
 }
 
+export async function startStreamingAsrSession(params: {
+  provider: AsrProviderConfig
+  language: string
+  meetingId: string
+  recordingRunId: string
+}): Promise<StreamingAsrSessionResponse> {
+  ensureTauriRuntime()
+
+  return invoke<StreamingAsrSessionResponse>('start_streaming_asr_session', {
+    request: {
+      cloudBaseUrl: params.provider.baseUrl,
+      cloudApiKey: params.provider.apiKey,
+      cloudModel: params.provider.model,
+      language: params.language,
+      meetingId: params.meetingId,
+      recordingRunId: params.recordingRunId,
+    },
+  })
+}
+
+export async function pushStreamingAsrAudio(params: { sessionId: string; audioBase64: string }): Promise<void> {
+  ensureTauriRuntime()
+
+  return invoke('push_streaming_asr_audio', {
+    request: {
+      sessionId: params.sessionId,
+      audioBase64: params.audioBase64,
+    },
+  })
+}
+
+export async function finishStreamingAsrSession(sessionId: string): Promise<void> {
+  ensureTauriRuntime()
+
+  return invoke('finish_streaming_asr_session', {
+    request: {
+      sessionId,
+    },
+  })
+}
+
+export async function cancelStreamingAsrSession(sessionId: string): Promise<void> {
+  ensureTauriRuntime()
+
+  return invoke('cancel_streaming_asr_session', {
+    request: {
+      sessionId,
+    },
+  })
+}
+
+export function listenStreamingAsrEvents(handler: (event: StreamingAsrEvent) => void): Promise<UnlistenFn> {
+  ensureTauriRuntime()
+
+  return listen<StreamingAsrEvent>('streaming-asr-event', (event) => handler(event.payload))
+}
+
 function isTauriRuntime(): boolean {
   const target = window as Window & {
     __TAURI__?: unknown
@@ -31,6 +94,12 @@ function isTauriRuntime(): boolean {
   }
 
   return Boolean(target.__TAURI__ || target.__TAURI_INTERNALS__)
+}
+
+function ensureTauriRuntime() {
+  if (!isTauriRuntime()) {
+    throw new Error('云端 ASR 转写需要在 Tauri 桌面版中运行。')
+  }
 }
 
 function blobToBase64(blob: Blob): Promise<string> {
