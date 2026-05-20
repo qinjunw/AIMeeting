@@ -171,6 +171,7 @@ function App() {
   const [captureLog, setCaptureLog] = useState<CaptureProbe[]>([])
   const [showEvidence, setShowEvidence] = useState(false)
   const [showAdvancedSettings, setShowAdvancedSettings] = useState(false)
+  const [showHistoryDetails, setShowHistoryDetails] = useState(false)
   const [isThinking, setIsThinking] = useState(false)
   const [speechStatus, setSpeechStatus] = useState<TranscriptionStatus>('idle')
   const [speechLang, setSpeechLang] = useState(() => loadJson(speechLangStorageKey, 'zh-CN'))
@@ -259,6 +260,12 @@ function App() {
   }, [meetings])
 
   useEffect(() => {
+    if (!selectedHistory) {
+      setShowHistoryDetails(false)
+    }
+  }, [selectedHistory])
+
+  useEffect(() => {
     saveJson(searchStorageKey, searchConfig)
   }, [searchConfig])
 
@@ -327,19 +334,20 @@ function App() {
   }, [])
 
   useEffect(() => {
-    if (!showAdvancedSettings) {
+    if (!showAdvancedSettings && !showHistoryDetails) {
       return
     }
 
     function closeOnEscape(event: KeyboardEvent) {
       if (event.key === 'Escape') {
         setShowAdvancedSettings(false)
+        setShowHistoryDetails(false)
       }
     }
 
     window.addEventListener('keydown', closeOnEscape)
     return () => window.removeEventListener('keydown', closeOnEscape)
-  }, [showAdvancedSettings])
+  }, [showAdvancedSettings, showHistoryDetails])
 
   useEffect(
     () => () => {
@@ -1461,6 +1469,15 @@ function App() {
             </div>
           )}
           <div className="history-cleanup">
+            <button
+              type="button"
+              className="icon-command history-detail-button"
+              onClick={() => setShowHistoryDetails(true)}
+              disabled={!selectedHistory}
+            >
+              <FileText size={15} />
+              <span>Details</span>
+            </button>
             <button type="button" className="icon-command" onClick={deleteCheckedHistory} disabled={checkedHistoryIds.length === 0}>
               <Trash2 size={15} />
               <span>Delete selected</span>
@@ -1962,6 +1979,61 @@ function App() {
             </div>
             <footer className="settings-modal-foot">
               <button type="button" className="icon-command primary" onClick={() => setShowAdvancedSettings(false)}>
+                <span>确定</span>
+              </button>
+            </footer>
+          </section>
+        </div>
+      ) : null}
+
+      {showHistoryDetails && selectedHistory ? (
+        <div className="modal-backdrop" onMouseDown={() => setShowHistoryDetails(false)}>
+          <section
+            className="settings-modal history-detail-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="history-detail-title"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <header className="settings-modal-head">
+              <div>
+                <p className="eyebrow">Archived Meeting</p>
+                <h2 id="history-detail-title">{selectedHistory.title}</h2>
+              </div>
+              <button
+                type="button"
+                className="modal-close"
+                onClick={() => setShowHistoryDetails(false)}
+                aria-label="Close session details"
+              >
+                <X size={18} />
+              </button>
+            </header>
+
+            <div className="history-detail-content">
+              <div className="history-detail-meta">
+                <span>{selectedHistory.status}</span>
+                <span>{selectedHistory.segments.length} segments</span>
+                <span>Stopped {formatClock(selectedHistory.stoppedAt)}</span>
+                {selectedHistory.digest.providerLabel ? <span>{selectedHistory.digest.providerLabel}</span> : null}
+              </div>
+              {selectedHistory.status === 'finalizing' ? (
+                <p className="history-detail-notice">这段会议还在整理中，稍后会更新最终纪要。</p>
+              ) : null}
+              {selectedHistory.error ? <p className="error-line">{selectedHistory.error}</p> : null}
+              <article className="history-detail-digest">
+                {selectedHistory.digest.text || '这段会议还没有生成纪要。'}
+              </article>
+              <small>
+                Updated{' '}
+                {selectedHistory.digest.updatedAt
+                  ? new Date(selectedHistory.digest.updatedAt).toLocaleString()
+                  : new Date(selectedHistory.updatedAt).toLocaleString()}
+              </small>
+            </div>
+
+            <footer className="settings-modal-foot">
+              <button type="button" className="icon-command primary" onClick={() => setShowHistoryDetails(false)}>
                 <span>确定</span>
               </button>
             </footer>
