@@ -2,7 +2,10 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
-use crate::persistence::{MeetingMinutesRow, MeetingRecordRow, RecordingAssetRow};
+use crate::persistence::{
+    import_legacy_meetings as persist_legacy_meetings, LegacyMeetingImport, MeetingMinutesRow,
+    MeetingRecordRow, RecordingAssetRow,
+};
 use crate::runtime::DesktopState;
 
 #[derive(Deserialize)]
@@ -24,6 +27,18 @@ pub(crate) struct MeetingIdsRequest {
     meeting_ids: Vec<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ImportLegacyMeetingsRequest {
+    meetings: Vec<LegacyMeetingImport>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ImportLegacyMeetingsResult {
+    imported: usize,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MeetingDetail {
@@ -43,6 +58,16 @@ pub(crate) fn list_meetings(
         .lock()
         .map_err(lock_error)?
         .list_meetings(false)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn import_legacy_meetings(
+    state: State<'_, DesktopState>,
+    request: ImportLegacyMeetingsRequest,
+) -> Result<ImportLegacyMeetingsResult, String> {
+    persist_legacy_meetings(state.paths.database_path(), &request.meetings)
+        .map(|imported| ImportLegacyMeetingsResult { imported })
         .map_err(|error| error.to_string())
 }
 

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 
 import type { AudioSourceSelection } from './bridge/recordingClient'
 import { HistorySidebar } from './features/history/HistorySidebar'
+import { importLegacyMeetingsFromStorage } from './features/history/legacyImport'
 import { useMeetingHistory } from './features/history/useMeetingHistory'
 import { MeetingWorkspace, type WorkspaceTab } from './features/meeting/MeetingWorkspace'
 import { RecordingBar } from './features/meeting/RecordingBar'
@@ -24,6 +25,15 @@ export default function App() {
   const [elapsedMs, setElapsedMs] = useState(0)
   const elapsedBeforeRun = useRef(0)
   const runStartedAt = useRef<number | null>(null)
+  const legacyImportStarted = useRef(false)
+
+  useEffect(() => {
+    if (legacyImportStarted.current) return
+    legacyImportStarted.current = true
+    void importLegacyMeetingsFromStorage()
+      .then((imported) => imported > 0 ? history.refresh({ deleted: false }) : undefined)
+      .catch(() => undefined)
+  }, [history.refresh])
 
   useEffect(() => {
     const status = session.recording.status

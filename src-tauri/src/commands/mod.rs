@@ -8,8 +8,8 @@ use jobs::{JobState, ProcessingJobStatus, ProcessingJobStatusRequest, RetryJobRe
 use tauri::{AppHandle, State};
 
 pub(crate) use meetings::{
-    get_meeting, get_meeting_detail, list_meetings, list_trash, permanently_delete_meetings,
-    rename_meeting, restore_meetings, trash_meetings,
+    get_meeting, get_meeting_detail, import_legacy_meetings, list_meetings, list_trash,
+    permanently_delete_meetings, rename_meeting, restore_meetings, trash_meetings,
 };
 pub(crate) use providers::{
     delete_provider_profile, list_provider_profiles, save_provider_profile, test_provider_profile,

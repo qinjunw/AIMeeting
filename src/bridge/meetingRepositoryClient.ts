@@ -43,6 +43,16 @@ export type MeetingPage = {
   nextCursor: string | null
 }
 
+export type LegacyMeetingImport = {
+  sourceId: string
+  title: string
+  transcript: string
+  minutes: string
+  createdAt: string
+  updatedAt: string
+  stoppedAt: string | null
+}
+
 export type ListMeetingsRequest = {
   deleted?: boolean
   cursor?: string | null
@@ -110,6 +120,16 @@ export function createMeetingRepositoryClient(
 }
 
 export const meetingRepositoryClient = createMeetingRepositoryClient()
+
+export async function importLegacyMeetings(
+  meetings: LegacyMeetingImport[],
+  transport: DesktopTransport = tauriTransport,
+): Promise<number> {
+  const result = await transport.invoke<{ imported: number }>('import_legacy_meetings', {
+    request: { meetings },
+  })
+  return result.imported
+}
 
 type WireMeetingRecord = {
   id: string

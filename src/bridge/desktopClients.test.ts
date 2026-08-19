@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { createMeetingRepositoryClient } from './meetingRepositoryClient'
+import { createMeetingRepositoryClient, importLegacyMeetings } from './meetingRepositoryClient'
 import {
   createProcessingJobClient,
   createProviderClient,
@@ -59,6 +59,25 @@ describe('desktop bridge clients', () => {
         { request: { meetingIds: ['meeting-1'] } },
       ],
     ])
+  })
+
+  it('sends normalized legacy text records through one import command', async () => {
+    const { transport, invoke } = createTransport()
+    invoke.mockResolvedValue({ imported: 1 })
+    const meetings = [{
+      sourceId: 'meeting_old_1',
+      title: '旧版周会',
+      transcript: '确认发布。',
+      minutes: '结论：发布。',
+      createdAt: '2026-05-01T08:00:00Z',
+      updatedAt: '2026-05-01T09:00:00Z',
+      stoppedAt: '2026-05-01T09:00:00Z',
+    }]
+
+    await expect(importLegacyMeetings(meetings, transport)).resolves.toBe(1)
+    expect(invoke).toHaveBeenCalledWith('import_legacy_meetings', {
+      request: { meetings },
+    })
   })
 
   it('passes secrets only through save and exposes typed processing jobs', async () => {

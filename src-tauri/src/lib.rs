@@ -10,11 +10,12 @@ pub mod runtime;
 use commands::{
     cancel_streaming_asr_session, capture_capabilities, delete_provider_profile,
     finish_streaming_asr_session, get_active_meeting, get_meeting, get_meeting_detail,
-    list_audio_devices, list_meetings, list_processing_jobs, list_provider_profiles, list_trash,
-    pause_recording, permanently_delete_meetings, push_streaming_asr_audio, rename_meeting,
-    restore_meetings, resume_recording, retry_minutes, retry_transcription, save_provider_profile,
-    secure_key_storage_status, start_recording, start_streaming_asr_session, stop_recording,
-    test_provider_profile, transcribe_audio_chunk, trash_meetings,
+    import_legacy_meetings, list_audio_devices, list_meetings, list_processing_jobs,
+    list_provider_profiles, list_trash, pause_recording, permanently_delete_meetings,
+    push_streaming_asr_audio, rename_meeting, restore_meetings, resume_recording, retry_minutes,
+    retry_transcription, save_provider_profile, secure_key_storage_status, start_recording,
+    start_streaming_asr_session, stop_recording, test_provider_profile, transcribe_audio_chunk,
+    trash_meetings,
 };
 use gateways::live_asr::dashscope::StreamingAsrState;
 use runtime::DesktopState;
@@ -47,6 +48,7 @@ pub fn run() {
             resume_recording,
             stop_recording,
             get_active_meeting,
+            import_legacy_meetings,
             list_meetings,
             get_meeting,
             get_meeting_detail,

@@ -1,5 +1,6 @@
 mod database;
 mod files;
+mod legacy_import;
 mod migrations;
 pub mod recovery;
 pub mod secrets;
@@ -9,6 +10,7 @@ pub use database::{
     ProcessingJobRow, RecordingAssetRow,
 };
 pub use files::DataPaths;
+pub use legacy_import::{import_legacy_meetings, LegacyMeetingImport};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PersistenceError {
