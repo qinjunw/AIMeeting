@@ -143,6 +143,10 @@ mod windows_probe {
             }
             while engine.pop_asr().is_some() {}
 
+            for (kind, warning) in coordinator.source_warnings() {
+                eprintln!("Warning: {kind:?} capture reported a recoverable issue: {warning}");
+            }
+
             if let Some((kind, error)) = coordinator.source_errors().into_iter().next() {
                 return Err(format!("{kind:?} capture failed: {error}").into());
             }

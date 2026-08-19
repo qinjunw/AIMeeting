@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, DeviceId, SampleFormat, Stream, SupportedStreamConfig};
+use cpal::{Device, DeviceId, ErrorKind, SampleFormat, Stream, SupportedStreamConfig};
 
 use crate::audio::capture::{
     convert_samples_to_f32, AudioCaptureSource, AudioDeviceInfo, CaptureError, CaptureFrameSink,
@@ -72,6 +72,7 @@ pub struct CpalCaptureSource {
     info: AudioDeviceInfo,
     stream: Option<Stream>,
     callback_error: Arc<Mutex<Option<String>>>,
+    callback_warning: Arc<Mutex<Option<String>>>,
 }
 
 impl CpalCaptureSource {
@@ -98,6 +99,7 @@ impl CpalCaptureSource {
             info: AudioDeviceInfo { is_default, ..info },
             stream: None,
             callback_error: Arc::new(Mutex::new(None)),
+            callback_warning: Arc::new(Mutex::new(None)),
         })
     }
 }
@@ -115,12 +117,16 @@ impl AudioCaptureSource for CpalCaptureSource {
         if let Ok(mut error) = self.callback_error.lock() {
             *error = None;
         }
+        if let Ok(mut warning) = self.callback_warning.lock() {
+            *warning = None;
+        }
         let stream = build_stream(
             &self.device,
             self.config,
             self.info.kind,
             sink,
             Arc::clone(&self.callback_error),
+            Arc::clone(&self.callback_warning),
         )?;
         stream
             .play()
@@ -139,6 +145,13 @@ impl AudioCaptureSource for CpalCaptureSource {
             .lock()
             .ok()
             .and_then(|mut error| error.take())
+    }
+
+    fn take_warning(&self) -> Option<String> {
+        self.callback_warning
+            .lock()
+            .ok()
+            .and_then(|mut warning| warning.take())
     }
 }
 
@@ -194,6 +207,7 @@ fn build_stream(
     kind: CaptureSourceKind,
     sink: CaptureFrameSink,
     callback_error: Arc<Mutex<Option<String>>>,
+    callback_warning: Arc<Mutex<Option<String>>>,
 ) -> Result<Stream, CaptureError> {
     let sample_rate = config.sample_rate();
     let channels = config.channels();
@@ -216,7 +230,7 @@ fn build_stream(
                         &error_state,
                     );
                 },
-                stream_error_callback(callback_error),
+                stream_error_callback(callback_error, callback_warning),
                 None,
             )
         }
@@ -235,7 +249,7 @@ fn build_stream(
                         &error_state,
                     );
                 },
-                stream_error_callback(callback_error),
+                stream_error_callback(callback_error, callback_warning),
                 None,
             )
         }
@@ -254,7 +268,7 @@ fn build_stream(
                         &error_state,
                     );
                 },
-                stream_error_callback(callback_error),
+                stream_error_callback(callback_error, callback_warning),
                 None,
             )
         }
@@ -290,8 +304,23 @@ fn emit_frame(
 
 fn stream_error_callback(
     callback_error: Arc<Mutex<Option<String>>>,
+    callback_warning: Arc<Mutex<Option<String>>>,
 ) -> impl FnMut(cpal::Error) + Send + 'static {
-    move |error| record_first_error(&callback_error, error.to_string())
+    move |error| {
+        let state = if is_recoverable_stream_issue(error.kind()) {
+            &callback_warning
+        } else {
+            &callback_error
+        };
+        record_first_error(state, error.to_string());
+    }
+}
+
+fn is_recoverable_stream_issue(kind: ErrorKind) -> bool {
+    matches!(
+        kind,
+        ErrorKind::DeviceChanged | ErrorKind::RealtimeDenied | ErrorKind::Xrun
+    )
 }
 
 fn record_first_error(error_state: &Arc<Mutex<Option<String>>>, message: String) {
@@ -299,5 +328,23 @@ fn record_first_error(error_state: &Arc<Mutex<Option<String>>>, message: String)
         if error.is_none() {
             *error = Some(message);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xrun_and_runtime_quality_events_are_recoverable() {
+        assert!(is_recoverable_stream_issue(ErrorKind::Xrun));
+        assert!(is_recoverable_stream_issue(ErrorKind::DeviceChanged));
+        assert!(is_recoverable_stream_issue(ErrorKind::RealtimeDenied));
+    }
+
+    #[test]
+    fn invalidated_and_backend_errors_remain_fatal() {
+        assert!(!is_recoverable_stream_issue(ErrorKind::StreamInvalidated));
+        assert!(!is_recoverable_stream_issue(ErrorKind::BackendError));
     }
 }

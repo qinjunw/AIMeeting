@@ -133,6 +133,10 @@ pub trait AudioCaptureSource: Send {
     fn start(&mut self, sink: CaptureFrameSink) -> Result<(), CaptureError>;
     fn stop(&mut self) -> Result<(), CaptureError>;
     fn take_error(&self) -> Option<String>;
+
+    fn take_warning(&self) -> Option<String> {
+        None
+    }
 }
 
 pub struct CaptureCoordinator {
@@ -236,6 +240,19 @@ impl CaptureCoordinator {
             }
         }
         errors
+    }
+
+    pub fn source_warnings(&self) -> Vec<(CaptureSourceKind, String)> {
+        let mut warnings = Vec::new();
+        for (kind, source) in [
+            (CaptureSourceKind::Microphone, self.microphone.as_ref()),
+            (CaptureSourceKind::System, self.system.as_ref()),
+        ] {
+            if let Some(warning) = source.and_then(|source| source.take_warning()) {
+                warnings.push((kind, warning));
+            }
+        }
+        warnings
     }
 }
 
