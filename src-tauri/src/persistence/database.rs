@@ -394,6 +394,16 @@ impl MeetingRepository {
         Ok(revision)
     }
 
+    pub fn latest_transcript_revision(&self, meeting_id: &str) -> Result<i64> {
+        self.connection
+            .query_row(
+                "SELECT COALESCE(MAX(revision), 0) FROM transcript_segments WHERE meeting_id = ?1",
+                params![meeting_id],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
     pub fn append_transcript_segment(
         &self,
         segment_id: &str,

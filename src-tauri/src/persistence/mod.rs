@@ -2,6 +2,7 @@ mod database;
 mod files;
 mod migrations;
 pub mod recovery;
+pub mod secrets;
 
 pub use database::{
     MeetingMinutesRow, MeetingRecordRow, MeetingRepository, NewMeetingRecord, NewProcessingJob,

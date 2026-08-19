@@ -1,3 +1,5 @@
+pub mod openai_compatible;
+
 use std::time::Duration;
 
 use futures_util::future::BoxFuture;

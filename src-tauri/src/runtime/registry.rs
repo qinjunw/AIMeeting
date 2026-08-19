@@ -321,7 +321,7 @@ fn recording_worker(
                 let next =
                     wait_while_paused(factory.as_ref(), &mut writer, &mut checkpoint, &command_rx)?;
                 match next {
-                    PausedExit::Resumed(resumed) => run = resumed,
+                    PausedExit::Resumed(resumed) => run = *resumed,
                     PausedExit::Stopped => {
                         writer.finalize().map_err(|error| error.to_string())?;
                         return Ok(checkpoint);
@@ -345,7 +345,7 @@ fn recording_worker(
 }
 
 enum PausedExit {
-    Resumed(ActiveRun),
+    Resumed(Box<ActiveRun>),
     Stopped,
 }
 
@@ -370,7 +370,7 @@ fn wait_while_paused(
             } => match ActiveRun::start(factory, writer, generation, selection) {
                 Ok(run) => {
                     let _ = reply.send(Ok(*checkpoint));
-                    return Ok(PausedExit::Resumed(run));
+                    return Ok(PausedExit::Resumed(Box::new(run)));
                 }
                 Err(error) => {
                     let _ = reply.send(Err(error));

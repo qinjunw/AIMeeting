@@ -1,9 +1,6 @@
-#[path = "../src/persistence/mod.rs"]
-mod persistence;
-
-use persistence::{
+use aimeeting_lib::persistence::{
     DataPaths, MeetingMinutesRow, MeetingRecordRow, MeetingRepository, NewMeetingRecord,
-    NewProcessingJob, ProcessingJobRow,
+    NewProcessingJob, PersistenceError, ProcessingJobRow,
 };
 use tempfile::TempDir;
 
@@ -12,6 +9,17 @@ fn test_repository() -> (TempDir, MeetingRepository) {
     let paths = DataPaths::new(temp.path()).expect("data paths");
     let repository = MeetingRepository::open(paths.database_path()).expect("repository");
     (temp, repository)
+}
+
+fn meeting_record(id: &str, title: &str) -> NewMeetingRecord {
+    NewMeetingRecord {
+        id: id.to_string(),
+        title: title.to_string(),
+        status: "preparing".to_string(),
+        transcription_status: "idle".to_string(),
+        minutes_status: "idle".to_string(),
+        created_at: "2026-08-19T00:00:00Z".to_string(),
+    }
 }
 
 #[test]
@@ -37,7 +45,7 @@ fn migrations_create_the_complete_v1_schema() {
 fn soft_deleted_meetings_are_hidden_and_can_be_restored() {
     let (_temp, repository) = test_repository();
     repository
-        .create_meeting(&NewMeetingRecord::for_test("meeting-1", "设计评审"))
+        .create_meeting(&meeting_record("meeting-1", "设计评审"))
         .expect("create meeting");
 
     let active: Vec<MeetingRecordRow> = repository.list_meetings(false).unwrap();
@@ -56,7 +64,7 @@ fn soft_deleted_meetings_are_hidden_and_can_be_restored() {
 fn meeting_processing_states_are_updated_together() {
     let (_temp, repository) = test_repository();
     repository
-        .create_meeting(&NewMeetingRecord::for_test("meeting-1", "架构评审"))
+        .create_meeting(&meeting_record("meeting-1", "架构评审"))
         .unwrap();
 
     repository
@@ -80,7 +88,7 @@ fn meeting_processing_states_are_updated_together() {
 fn recording_lifecycle_metadata_is_persisted_with_the_local_asset() {
     let (_directory, repository) = test_repository();
     repository
-        .create_meeting(&NewMeetingRecord::for_test("meeting-recording", "录音测试"))
+        .create_meeting(&meeting_record("meeting-recording", "录音测试"))
         .unwrap();
 
     repository
@@ -134,7 +142,7 @@ fn recording_lifecycle_metadata_is_persisted_with_the_local_asset() {
 fn transcript_revisions_are_append_only() {
     let (_temp, repository) = test_repository();
     repository
-        .create_meeting(&NewMeetingRecord::for_test("meeting-1", "项目周会"))
+        .create_meeting(&meeting_record("meeting-1", "项目周会"))
         .expect("create meeting");
 
     assert_eq!(repository.next_transcript_revision("meeting-1").unwrap(), 1);
@@ -159,7 +167,7 @@ fn transcript_revisions_are_append_only() {
 fn startup_recovery_marks_incomplete_meetings_interrupted() {
     let (_temp, repository) = test_repository();
     repository
-        .create_meeting(&NewMeetingRecord::for_test("meeting-1", "未完成会议"))
+        .create_meeting(&meeting_record("meeting-1", "未完成会议"))
         .unwrap();
     repository
         .update_meeting_states(
@@ -186,7 +194,7 @@ fn startup_recovery_marks_incomplete_meetings_interrupted() {
 fn minutes_reject_a_revision_older_than_the_latest_result() {
     let (_temp, repository) = test_repository();
     repository
-        .create_meeting(&NewMeetingRecord::for_test("meeting-1", "产品周会"))
+        .create_meeting(&meeting_record("meeting-1", "产品周会"))
         .unwrap();
 
     repository
@@ -195,7 +203,7 @@ fn minutes_reject_a_revision_older_than_the_latest_result() {
     let stale = repository.save_minutes("minutes-1", "meeting-1", 1, "旧版纪要", "test-provider");
     assert!(matches!(
         stale,
-        Err(persistence::PersistenceError::StaleRevision {
+        Err(PersistenceError::StaleRevision {
             current: 2,
             attempted: 1
         })
@@ -208,15 +216,16 @@ fn minutes_reject_a_revision_older_than_the_latest_result() {
 fn processing_jobs_are_claimed_once_and_increment_attempts() {
     let (_temp, repository) = test_repository();
     repository
-        .create_meeting(&NewMeetingRecord::for_test("meeting-1", "故障恢复"))
+        .create_meeting(&meeting_record("meeting-1", "故障恢复"))
         .unwrap();
     repository
-        .enqueue_processing_job(&NewProcessingJob::for_test(
-            "job-1",
-            "meeting-1",
-            "file_transcription",
-            Some(3),
-        ))
+        .enqueue_processing_job(&NewProcessingJob {
+            id: "job-1".to_string(),
+            meeting_id: "meeting-1".to_string(),
+            job_type: "file_transcription".to_string(),
+            input_revision: Some(3),
+            created_at: "2026-08-19T00:00:00Z".to_string(),
+        })
         .unwrap();
 
     let claimed: ProcessingJobRow = repository
@@ -237,7 +246,7 @@ fn processing_jobs_are_claimed_once_and_increment_attempts() {
 fn permanent_delete_only_removes_a_trashed_meeting() {
     let (_temp, repository) = test_repository();
     repository
-        .create_meeting(&NewMeetingRecord::for_test("meeting-1", "保留会议"))
+        .create_meeting(&meeting_record("meeting-1", "保留会议"))
         .unwrap();
 
     repository.permanently_delete_meeting("meeting-1").unwrap();
@@ -257,7 +266,7 @@ fn recovery_parts_are_returned_in_run_order() {
     std::fs::write(temp.path().join("run-001.part"), b"first").unwrap();
     std::fs::write(temp.path().join("ignore.txt"), b"ignored").unwrap();
 
-    let parts = persistence::recovery::recovery_parts(temp.path()).unwrap();
+    let parts = aimeeting_lib::persistence::recovery::recovery_parts(temp.path()).unwrap();
     let names = parts
         .iter()
         .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())

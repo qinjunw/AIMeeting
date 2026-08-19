@@ -4,7 +4,7 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::audio::capture::{AudioDeviceInfo, SourceSelection};
 use crate::audio::platform::windows::enumerate_audio_devices;
-use crate::persistence::{MeetingRecordRow, NewMeetingRecord};
+use crate::persistence::NewMeetingRecord;
 use crate::runtime::registry::{recording_file_size, ActiveRecordingSnapshot, RecordingCheckpoint};
 use crate::runtime::DesktopState;
 
@@ -14,8 +14,14 @@ const RECORDING_FILE_NAME: &str = "recording.opus";
 #[serde(rename_all = "camelCase")]
 pub(crate) struct StartRecordingRequest {
     title: Option<String>,
-    microphone_enabled: bool,
-    system_enabled: bool,
+    sources: AudioSourcesRequest,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AudioSourcesRequest {
+    microphone: bool,
+    system_audio: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -28,14 +34,20 @@ pub(crate) struct MeetingRecordingRequest {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ResumeRecordingRequest {
     meeting_id: String,
-    microphone_enabled: bool,
-    system_enabled: bool,
+    sources: AudioSourcesRequest,
 }
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct MeetingStateEvent {
-    meeting: MeetingRecordRow,
+pub(crate) struct SessionSnapshot {
+    meeting_id: String,
+    run_generation: u64,
+    recording_status: String,
+    transcript_revision: u64,
+    transcription_status: String,
+    transcription_error: Option<String>,
+    minutes_status: String,
+    minutes_error: Option<String>,
 }
 
 #[tauri::command]
@@ -48,8 +60,8 @@ pub(crate) fn start_recording(
     app: AppHandle,
     state: State<'_, DesktopState>,
     request: StartRecordingRequest,
-) -> Result<MeetingRecordRow, String> {
-    let selection = source_selection(request.microphone_enabled, request.system_enabled)?;
+) -> Result<SessionSnapshot, String> {
+    let selection = source_selection(request.sources.microphone, request.sources.system_audio)?;
     let meeting_id = uuid::Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
     let title = request
@@ -126,7 +138,7 @@ pub(crate) fn start_recording(
         return Err(error);
     }
 
-    load_and_emit(&app, &state, &meeting_id)
+    load_and_emit(&app, &state, &meeting_id, 1)
 }
 
 #[tauri::command]
@@ -134,7 +146,7 @@ pub(crate) fn pause_recording(
     app: AppHandle,
     state: State<'_, DesktopState>,
     request: MeetingRecordingRequest,
-) -> Result<MeetingRecordRow, String> {
+) -> Result<SessionSnapshot, String> {
     let snapshot = state
         .recordings
         .lock()
@@ -149,7 +161,7 @@ pub(crate) fn pause_recording(
         .update_meeting_states(&request.meeting_id, "paused", "pending", "pending", &now)
         .map_err(|error| error.to_string())?;
     drop(repository);
-    load_and_emit(&app, &state, &request.meeting_id)
+    load_and_emit(&app, &state, &request.meeting_id, snapshot.generation)
 }
 
 #[tauri::command]
@@ -157,8 +169,8 @@ pub(crate) fn resume_recording(
     app: AppHandle,
     state: State<'_, DesktopState>,
     request: ResumeRecordingRequest,
-) -> Result<MeetingRecordRow, String> {
-    let selection = source_selection(request.microphone_enabled, request.system_enabled)?;
+) -> Result<SessionSnapshot, String> {
+    let selection = source_selection(request.sources.microphone, request.sources.system_audio)?;
     let current = state
         .recordings
         .lock()
@@ -191,7 +203,7 @@ pub(crate) fn resume_recording(
         .update_meeting_states(&request.meeting_id, "recording", "pending", "pending", &now)
         .map_err(|error| error.to_string())?;
     drop(repository);
-    load_and_emit(&app, &state, &request.meeting_id)
+    load_and_emit(&app, &state, &request.meeting_id, generation)
 }
 
 #[tauri::command]
@@ -199,7 +211,7 @@ pub(crate) fn stop_recording(
     app: AppHandle,
     state: State<'_, DesktopState>,
     request: MeetingRecordingRequest,
-) -> Result<MeetingRecordRow, String> {
+) -> Result<SessionSnapshot, String> {
     let snapshot = state
         .recordings
         .lock()
@@ -215,14 +227,17 @@ pub(crate) fn stop_recording(
         .map_err(lock_error)?
         .stop(&request.meeting_id)?;
     persist_stopped_recording(&state, &snapshot, checkpoint)?;
-    load_and_emit(&app, &state, &request.meeting_id)
+    load_and_emit(&app, &state, &request.meeting_id, snapshot.generation)
 }
 
 #[tauri::command]
 pub(crate) fn get_active_meeting(
     state: State<'_, DesktopState>,
-) -> Result<Option<ActiveRecordingSnapshot>, String> {
-    Ok(state.recordings.lock().map_err(lock_error)?.active())
+) -> Result<Option<SessionSnapshot>, String> {
+    let active = state.recordings.lock().map_err(lock_error)?.active();
+    active
+        .map(|active| session_snapshot(&state, &active.meeting_id, active.generation))
+        .transpose()
 }
 
 fn persist_stopped_recording(
@@ -258,22 +273,38 @@ fn load_and_emit(
     app: &AppHandle,
     state: &DesktopState,
     meeting_id: &str,
-) -> Result<MeetingRecordRow, String> {
-    let meeting = state
-        .repository
-        .lock()
-        .map_err(lock_error)?
+    run_generation: u64,
+) -> Result<SessionSnapshot, String> {
+    let snapshot = session_snapshot(state, meeting_id, run_generation)?;
+    app.emit("meeting-state-event", snapshot.clone())
+        .map_err(|error| error.to_string())?;
+    Ok(snapshot)
+}
+
+fn session_snapshot(
+    state: &DesktopState,
+    meeting_id: &str,
+    run_generation: u64,
+) -> Result<SessionSnapshot, String> {
+    let repository = state.repository.lock().map_err(lock_error)?;
+    let meeting = repository
         .get_meeting(meeting_id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "会议记录不存在。".to_string())?;
-    app.emit(
-        "meeting-state-event",
-        MeetingStateEvent {
-            meeting: meeting.clone(),
-        },
-    )
-    .map_err(|error| error.to_string())?;
-    Ok(meeting)
+    let transcript_revision = repository
+        .latest_transcript_revision(meeting_id)
+        .map_err(|error| error.to_string())?;
+    Ok(SessionSnapshot {
+        meeting_id: meeting.id,
+        run_generation,
+        recording_status: meeting.status,
+        transcript_revision: u64::try_from(transcript_revision)
+            .map_err(|_| "转写版本号无效。".to_string())?,
+        transcription_status: meeting.transcription_status,
+        transcription_error: None,
+        minutes_status: meeting.minutes_status,
+        minutes_error: None,
+    })
 }
 
 fn source_selection(microphone: bool, system: bool) -> Result<SourceSelection, String> {

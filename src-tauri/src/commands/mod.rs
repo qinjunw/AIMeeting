@@ -1,14 +1,66 @@
+pub mod jobs;
 mod meetings;
+pub mod providers;
 mod recording;
+
+use chrono::Utc;
+use jobs::{JobState, ProcessingJobStatus, ProcessingJobStatusRequest, RetryJobRequest};
+use tauri::State;
 
 pub(crate) use meetings::{
     get_meeting, get_meeting_detail, list_meetings, list_trash, permanently_delete_meetings,
     rename_meeting, restore_meetings, trash_meetings,
 };
+pub(crate) use providers::{
+    delete_provider_profile, list_provider_profiles, save_provider_profile, test_provider_profile,
+};
 pub(crate) use recording::{
     get_active_meeting, list_audio_devices, pause_recording, resume_recording, start_recording,
     stop_recording,
 };
+
+#[tauri::command]
+pub(crate) fn list_processing_jobs(
+    state: State<'_, JobState>,
+    request: ProcessingJobStatusRequest,
+) -> Result<Vec<ProcessingJobStatus>, String> {
+    let store = state.store().map_err(|error| error.to_string())?;
+    jobs::processing_job_status(&store, request).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn retry_transcription(
+    state: State<'_, JobState>,
+    request: jobs::DesktopRetryJobRequest,
+) -> Result<ProcessingJobStatus, String> {
+    let mut store = state.store().map_err(|error| error.to_string())?;
+    jobs::retry_transcription(
+        &mut store,
+        RetryJobRequest {
+            meeting_id: request.meeting_id,
+            input_revision: request.transcript_revision,
+            requested_at: Utc::now().to_rfc3339(),
+        },
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn retry_minutes(
+    state: State<'_, JobState>,
+    request: jobs::DesktopRetryJobRequest,
+) -> Result<ProcessingJobStatus, String> {
+    let mut store = state.store().map_err(|error| error.to_string())?;
+    jobs::retry_minutes(
+        &mut store,
+        RetryJobRequest {
+            meeting_id: request.meeting_id,
+            input_revision: request.transcript_revision,
+            requested_at: Utc::now().to_rfc3339(),
+        },
+    )
+    .map_err(|error| error.to_string())
+}
 
 use crate::gateways::{
     file_asr::openai_compatible::{self, TranscribeAudioRequest, TranscribeAudioResponse},
