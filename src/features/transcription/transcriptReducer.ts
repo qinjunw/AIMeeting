@@ -47,7 +47,7 @@ export function transcriptReducer(
   state: TranscriptState,
   action: TranscriptReducerAction,
 ): TranscriptState {
-  if (isStaleEvent(state, action.payload)) {
+  if (isStaleIdentity(state, action.payload) || action.payload.revision < state.revision) {
     return state
   }
 
@@ -55,8 +55,12 @@ export function transcriptReducer(
     return {
       ...state,
       revision: action.payload.revision,
-      interimText: action.payload.text,
+      interimText: normalizeTranscriptText(action.payload.text),
     }
+  }
+
+  if (state.segments.some((segment) => segment.id === action.payload.segmentId)) {
+    return state
   }
 
   const text = normalizeTranscriptText(action.payload.text)
@@ -80,13 +84,12 @@ export function transcriptReducer(
   }
 }
 
-function isStaleEvent(
+function isStaleIdentity(
   state: TranscriptState,
   event: TranscriptEventIdentity,
 ): boolean {
   return (
     event.meetingId !== state.meetingId ||
-    event.runGeneration !== state.runGeneration ||
-    event.revision <= state.revision
+    event.runGeneration !== state.runGeneration
   )
 }

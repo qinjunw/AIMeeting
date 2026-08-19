@@ -5,7 +5,7 @@ import {
 } from './recordingMachine'
 
 describe('recordingMachineReducer', () => {
-  it('covers start, started, pause, resume, stop, and stopped transitions', () => {
+  it('covers start, pause, resume, stop, processing, and ready transitions', () => {
     let state = createRecordingMachineState()
 
     state = recordingMachineReducer(state, {
@@ -42,6 +42,9 @@ describe('recordingMachineReducer', () => {
     expect(state.recordingStatus).toBe('stopping')
 
     state = recordingMachineReducer(state, { type: 'stopped' })
+    expect(state.recordingStatus).toBe('processing')
+
+    state = recordingMachineReducer(state, { type: 'ready' })
     expect(state.recordingStatus).toBe('ready')
   })
 

@@ -67,6 +67,34 @@ describe('transcriptReducer', () => {
     ])
   })
 
+  it('accepts a final result with the same revision as its interim result', () => {
+    let state = transcriptReducer(createTranscriptState('meeting-1', 1), {
+      type: 'interim',
+      payload: {
+        meetingId: 'meeting-1',
+        runGeneration: 1,
+        revision: 8,
+        text: '我們正在討論',
+      },
+    })
+
+    state = transcriptReducer(state, {
+      type: 'final',
+      payload: {
+        meetingId: 'meeting-1',
+        runGeneration: 1,
+        revision: 8,
+        segmentId: 'segment-8',
+        text: '我們正在討論方案',
+        beginMs: 0,
+        endMs: 800,
+      },
+    })
+
+    expect(state.interimText).toBe('')
+    expect(state.segments.map((segment) => segment.text)).toEqual(['我们正在讨论方案'])
+  })
+
   it.each([
     {
       name: 'another meeting',

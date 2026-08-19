@@ -23,6 +23,7 @@ export type RecordingMachineAction =
   | { type: 'resume'; payload: { runGeneration: number } }
   | { type: 'stop' }
   | { type: 'stopped' }
+  | { type: 'ready' }
   | { type: 'interrupted' }
   | { type: 'recover' }
   | {
@@ -95,6 +96,10 @@ export function recordingMachineReducer(
         : state
     case 'stopped':
       return state.recordingStatus === 'stopping'
+        ? { ...state, recordingStatus: 'processing' }
+        : state
+    case 'ready':
+      return state.recordingStatus === 'processing'
         ? { ...state, recordingStatus: 'ready' }
         : state
     case 'interrupted':
