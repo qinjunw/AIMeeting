@@ -9,7 +9,7 @@ pub use database::{
     MeetingMinutesRow, MeetingRecordRow, MeetingRepository, NewMeetingRecord, NewProcessingJob,
     ProcessingJobRow, RecordingAssetRow,
 };
-pub use files::DataPaths;
+pub use files::{migrate_legacy_data_root, DataPaths, DataRootMigration};
 pub use legacy_import::{import_legacy_meetings, LegacyMeetingImport};
 
 #[derive(Debug, thiserror::Error)]

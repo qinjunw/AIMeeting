@@ -1,4 +1,3 @@
-use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -92,13 +91,6 @@ pub(crate) struct StartStreamingAsrRequest {
 pub(crate) struct StartStreamingAsrResponse {
     session_id: String,
     provider_label: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct PushStreamingAsrAudioRequest {
-    session_id: String,
-    audio_base64: String,
 }
 
 #[derive(Deserialize)]
@@ -246,36 +238,6 @@ pub(crate) async fn run_native_streaming_asr_bridge(
     .await;
 }
 
-pub(crate) async fn push_streaming_asr_audio(
-    state: &StreamingAsrState,
-    request: PushStreamingAsrAudioRequest,
-) -> Result<(), String> {
-    let audio = base64::engine::general_purpose::STANDARD
-        .decode(request.audio_base64.trim())
-        .map_err(|error| format!("实时 ASR 音频帧不是有效的 base64：{error}"))?;
-
-    if audio.is_empty() {
-        return Ok(());
-    }
-
-    let audio_tx = {
-        let sessions = state.sessions.lock().await;
-        sessions
-            .get(&request.session_id)
-            .map(|session| session.audio_tx.clone())
-            .ok_or_else(|| "实时 ASR session 不存在或已经结束。".to_string())?
-    };
-
-    audio_tx
-        .try_send(StreamingAsrCommand::Audio(audio))
-        .map_err(|error| match error {
-            mpsc::error::TrySendError::Full(_) => {
-                "实时 ASR 音频队列已满，当前网络或 Provider 处理速度跟不上。".to_string()
-            }
-            mpsc::error::TrySendError::Closed(_) => "实时 ASR session 已关闭。".to_string(),
-        })
-}
-
 pub(crate) async fn finish_streaming_asr_session(
     state: &StreamingAsrState,
     request: StreamingAsrSessionRequest,
@@ -292,23 +254,6 @@ pub(crate) async fn finish_streaming_asr_session(
             .send(StreamingAsrCommand::Finish)
             .await
             .map_err(|_| "实时 ASR session 已关闭。".to_string())?;
-    }
-    Ok(())
-}
-
-pub(crate) async fn cancel_streaming_asr_session(
-    state: &StreamingAsrState,
-    request: StreamingAsrSessionRequest,
-) -> Result<(), String> {
-    let audio_tx = {
-        let mut sessions = state.sessions.lock().await;
-        sessions
-            .remove(&request.session_id)
-            .map(|session| session.audio_tx)
-    };
-
-    if let Some(audio_tx) = audio_tx {
-        let _ = audio_tx.send(StreamingAsrCommand::Cancel).await;
     }
     Ok(())
 }
@@ -333,7 +278,9 @@ async fn run_streaming_asr_session(
         request.headers_mut().insert("Authorization", auth_value);
         request.headers_mut().insert(
             "user-agent",
-            "AIMeeting/0.1".parse().expect("static user agent"),
+            concat!("AIMeeting/", env!("CARGO_PKG_VERSION"))
+                .parse()
+                .expect("package version is a valid user agent"),
         );
 
         let (mut websocket, _) = connect_async(request)

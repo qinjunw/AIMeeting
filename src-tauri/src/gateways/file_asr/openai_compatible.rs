@@ -1,6 +1,6 @@
 use base64::Engine;
 use reqwest::multipart;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::Path;
 use std::time::Duration;
@@ -22,7 +22,6 @@ pub(crate) async fn transcribe_audio_file(
     }
     transcribe_with_cloud(
         &TranscribeAudioRequest {
-            audio_base64: String::new(),
             mime_type: "audio/ogg".to_string(),
             cloud_base_url: config.base_url,
             cloud_api_key: config.api_key,
@@ -34,10 +33,7 @@ pub(crate) async fn transcribe_audio_file(
     .await
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct TranscribeAudioRequest {
-    audio_base64: String,
+struct TranscribeAudioRequest {
     mime_type: String,
     cloud_base_url: String,
     cloud_api_key: String,
@@ -45,41 +41,9 @@ pub(crate) struct TranscribeAudioRequest {
     language: String,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct TranscribeAudioResponse {
-    text: String,
-    provider_label: String,
-}
-
 #[derive(Deserialize)]
 struct CloudTranscriptionResponse {
     text: Option<String>,
-}
-
-pub(crate) async fn transcribe_audio_chunk(
-    request: TranscribeAudioRequest,
-) -> Result<TranscribeAudioResponse, String> {
-    let audio = base64::engine::general_purpose::STANDARD
-        .decode(request.audio_base64.trim())
-        .map_err(|error| format!("音频数据不是有效的 base64：{error}"))?;
-
-    if audio.is_empty() {
-        return Err("音频片段为空。".to_string());
-    }
-
-    if request.cloud_base_url.trim().is_empty()
-        || request.cloud_api_key.trim().is_empty()
-        || request.cloud_model.trim().is_empty()
-    {
-        return Err("请先完整配置云端 ASR Provider 的 Base URL、Model 和 API key。".to_string());
-    }
-
-    let text = transcribe_with_cloud(&request, audio).await?;
-    Ok(TranscribeAudioResponse {
-        text,
-        provider_label: format!("{} via cloud ASR", request.cloud_model.trim()),
-    })
 }
 
 async fn transcribe_with_cloud(

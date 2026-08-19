@@ -250,7 +250,7 @@ where
             id: request.id,
             capability: request.capability,
             name: request.name.trim().to_string(),
-            base_url: request.base_url.trim_end_matches('/').to_string(),
+            base_url: request.base_url.trim().trim_end_matches('/').to_string(),
             model: request.model.trim().to_string(),
             endpoint_flavor: request.endpoint_flavor,
             secret_reference: has_secret.then_some(reference.clone()),
@@ -454,10 +454,37 @@ fn validate_request(request: &SaveProviderRequest) -> Result<(), ProviderError> 
             "name, base URL, and model are required".to_string(),
         ));
     }
-    if !request.base_url.starts_with("https://") && !request.base_url.starts_with("http://") {
+    let base_url = reqwest::Url::parse(request.base_url.trim()).map_err(|error| {
+        ProviderError::InvalidConfiguration(format!("base URL is invalid: {error}"))
+    })?;
+    if !base_url.username().is_empty() || base_url.password().is_some() {
         return Err(ProviderError::InvalidConfiguration(
-            "base URL must use HTTP or HTTPS".to_string(),
+            "base URL must not contain embedded credentials".to_string(),
         ));
+    }
+    if base_url.query().is_some() || base_url.fragment().is_some() {
+        return Err(ProviderError::InvalidConfiguration(
+            "base URL must not contain a query or fragment".to_string(),
+        ));
+    }
+    let host = base_url
+        .host_str()
+        .ok_or_else(|| ProviderError::InvalidConfiguration("base URL has no host".to_string()))?
+        .trim_matches(['[', ']']);
+    let loopback = host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1";
+    match base_url.scheme() {
+        "https" => {}
+        "http" if loopback => {}
+        "http" => {
+            return Err(ProviderError::InvalidConfiguration(
+                "remote provider base URL must use HTTPS".to_string(),
+            ));
+        }
+        _ => {
+            return Err(ProviderError::InvalidConfiguration(
+                "base URL must use HTTPS, or HTTP on loopback".to_string(),
+            ));
+        }
     }
     Ok(())
 }
@@ -581,5 +608,45 @@ impl ProviderTester for HttpProviderTester {
                 )))
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(base_url: &str) -> SaveProviderRequest {
+        SaveProviderRequest {
+            id: "test-provider".to_string(),
+            capability: ProviderCapability::Minutes,
+            name: "Test Provider".to_string(),
+            base_url: base_url.to_string(),
+            model: "test-model".to_string(),
+            endpoint_flavor: EndpointFlavor::ChatCompletions,
+            is_default: true,
+            api_key: None,
+        }
+    }
+
+    #[test]
+    fn provider_url_requires_https_for_remote_hosts() {
+        assert!(validate_request(&request("https://api.example.com/v1")).is_ok());
+        assert!(validate_request(&request("http://api.example.com/v1")).is_err());
+    }
+
+    #[test]
+    fn provider_url_allows_loopback_http_for_local_development() {
+        for url in [
+            "http://localhost:1234/v1",
+            "http://127.0.0.1:1234/v1",
+            "http://[::1]:1234/v1",
+        ] {
+            assert!(validate_request(&request(url)).is_ok(), "rejected {url}");
+        }
+    }
+
+    #[test]
+    fn provider_url_rejects_embedded_credentials() {
+        assert!(validate_request(&request("https://user:password@example.com/v1")).is_err());
     }
 }
