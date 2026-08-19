@@ -15,6 +15,7 @@ pub struct AudioEngineConfig {
     pub output_frame_samples: usize,
     pub recorder_capacity_samples: usize,
     pub asr_capacity_samples: usize,
+    pub alignment_latency: Duration,
     pub silence_rms_threshold: f32,
     pub silence_warning_after: Duration,
     pub mixer: MixerConfig,
@@ -27,6 +28,7 @@ impl Default for AudioEngineConfig {
             output_frame_samples: 960,
             recorder_capacity_samples: 48_000 * 5,
             asr_capacity_samples: 48_000,
+            alignment_latency: Duration::from_millis(100),
             silence_rms_threshold: 0.000_1,
             silence_warning_after: Duration::from_secs(3),
             mixer: MixerConfig {
@@ -65,6 +67,7 @@ pub struct AudioEngine {
     system: SourceNormalizer,
     pending_microphone: BTreeMap<Duration, AudioFrame>,
     pending_system: BTreeMap<Duration, AudioFrame>,
+    next_output_samples: u64,
     recorder: BoundedFrameQueue,
     asr: BoundedFrameQueue,
     microphone_silent_samples: u64,
@@ -104,6 +107,7 @@ impl AudioEngine {
             ),
             pending_microphone: BTreeMap::new(),
             pending_system: BTreeMap::new(),
+            next_output_samples: 0,
             recorder: BoundedFrameQueue::new(config.recorder_capacity_samples)?,
             asr: BoundedFrameQueue::new(config.asr_capacity_samples)?,
             config,
@@ -130,17 +134,17 @@ impl AudioEngine {
         };
         for frame in normalized {
             self.observe_health(kind, &frame);
-            if self.selection == SourceSelection::mixed() {
-                self.buffer_mixed(kind, frame)?;
-            } else {
-                let mixed = match kind {
-                    CaptureSourceKind::Microphone => self.mixer.mix(Some(&frame), None)?,
-                    CaptureSourceKind::System => self.mixer.mix(None, Some(&frame))?,
-                };
-                self.dispatch(mixed)?;
-            }
+            self.buffer_source(kind, frame)?;
         }
         Ok(())
+    }
+
+    pub fn advance_to(&mut self, elapsed: Duration) -> Result<(), AudioEngineError> {
+        self.emit_until(elapsed.saturating_sub(self.config.alignment_latency))
+    }
+
+    pub fn flush_to(&mut self, elapsed: Duration) -> Result<(), AudioEngineError> {
+        self.emit_until(elapsed)
     }
 
     pub fn pop_recorder(&mut self) -> Option<AudioFrame> {
@@ -191,12 +195,17 @@ impl AudioEngine {
         }
     }
 
-    fn buffer_mixed(
+    fn buffer_source(
         &mut self,
         kind: CaptureSourceKind,
         frame: AudioFrame,
     ) -> Result<(), AudioEngineError> {
         let timestamp = frame.timestamp();
+        let next_timestamp =
+            duration_for_samples(self.next_output_samples, self.config.output_sample_rate);
+        if timestamp < next_timestamp {
+            return Ok(());
+        }
         match kind {
             CaptureSourceKind::Microphone => {
                 self.pending_microphone.insert(timestamp, frame);
@@ -206,31 +215,43 @@ impl AudioEngine {
             }
         }
 
-        while let Some(timestamp) = self
-            .pending_microphone
-            .keys()
-            .find(|timestamp| self.pending_system.contains_key(timestamp))
-            .copied()
-        {
-            let microphone = self
-                .pending_microphone
-                .remove(&timestamp)
-                .expect("matching microphone frame exists");
-            let system = self
-                .pending_system
-                .remove(&timestamp)
-                .expect("matching system frame exists");
-            let mixed = self.mixer.mix(Some(&microphone), Some(&system))?;
-            self.dispatch(mixed)?;
-        }
-
-        let pending_samples = (self.pending_microphone.len() + self.pending_system.len())
+        let pending_samples = self.pending_microphone.len().max(self.pending_system.len())
             * self.config.output_frame_samples;
         if pending_samples > self.config.recorder_capacity_samples {
             return Err(AudioEngineError::SourceAlignmentQueueFull {
                 capacity_samples: self.config.recorder_capacity_samples,
                 attempted_samples: pending_samples,
             });
+        }
+        Ok(())
+    }
+
+    fn emit_until(&mut self, horizon: Duration) -> Result<(), AudioEngineError> {
+        let frame_duration = duration_for_samples(
+            self.config.output_frame_samples as u64,
+            self.config.output_sample_rate,
+        );
+        loop {
+            let timestamp =
+                duration_for_samples(self.next_output_samples, self.config.output_sample_rate);
+            if timestamp.saturating_add(frame_duration) > horizon {
+                break;
+            }
+
+            let microphone = self.pending_microphone.remove(&timestamp);
+            let system = self.pending_system.remove(&timestamp);
+            let mixed = match (microphone.as_ref(), system.as_ref()) {
+                (None, None) => AudioFrame::new(
+                    AudioSource::Mixed,
+                    timestamp,
+                    self.config.output_sample_rate,
+                    1,
+                    vec![0.0; self.config.output_frame_samples],
+                )?,
+                (microphone, system) => self.mixer.mix(microphone, system)?,
+            };
+            self.dispatch(mixed)?;
+            self.next_output_samples += self.config.output_frame_samples as u64;
         }
         Ok(())
     }
@@ -266,6 +287,7 @@ struct SourceNormalizer {
     resampler: Option<StreamingLinearResampler>,
     buffered: VecDeque<f32>,
     output_samples: u64,
+    expected_input_end: Option<Duration>,
 }
 
 impl SourceNormalizer {
@@ -278,6 +300,7 @@ impl SourceNormalizer {
             resampler: None,
             buffered: VecDeque::new(),
             output_samples: 0,
+            expected_input_end: None,
         }
     }
 
@@ -293,13 +316,28 @@ impl SourceNormalizer {
                 incoming: frame.sample_rate(),
             });
         }
-        if self.resampler.is_none() {
+        let input_duration =
+            duration_for_samples(frame.sample_frames() as u64, frame.sample_rate());
+        let discontinuity_tolerance = duration_for_samples(
+            (self.output_frame_samples * 2) as u64,
+            self.output_sample_rate,
+        );
+        let is_discontinuous = self.expected_input_end.is_some_and(|expected| {
+            frame.timestamp() > expected.saturating_add(discontinuity_tolerance)
+        });
+        if self.resampler.is_none() || is_discontinuous {
             self.input_sample_rate = Some(frame.sample_rate());
             self.resampler = Some(StreamingLinearResampler::new(
                 frame.sample_rate(),
                 self.output_sample_rate,
             )?);
+            self.buffered.clear();
+            self.output_samples = snap_to_frame_grid(
+                samples_for_duration(frame.timestamp(), self.output_sample_rate),
+                self.output_frame_samples,
+            );
         }
+        self.expected_input_end = Some(frame.timestamp().saturating_add(input_duration));
         let samples = self
             .resampler
             .as_mut()
@@ -326,6 +364,15 @@ impl SourceNormalizer {
 
 fn duration_for_samples(samples: u64, sample_rate: u32) -> Duration {
     Duration::from_secs_f64(samples as f64 / sample_rate as f64)
+}
+
+fn samples_for_duration(duration: Duration, sample_rate: u32) -> u64 {
+    (duration.as_secs_f64() * sample_rate as f64).round() as u64
+}
+
+fn snap_to_frame_grid(samples: u64, frame_samples: usize) -> u64 {
+    let frame_samples = frame_samples as u64;
+    ((samples + frame_samples / 2) / frame_samples) * frame_samples
 }
 
 #[derive(Debug, Error)]

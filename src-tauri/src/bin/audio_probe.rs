@@ -2,7 +2,7 @@
 mod windows_probe {
     use std::error::Error;
     use std::path::PathBuf;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use aimeeting_lib::audio::capture::{
         capture_channel, AudioCaptureSource, CaptureCoordinator, CaptureSourceKind, SourceSelection,
@@ -66,6 +66,7 @@ mod windows_probe {
 
         let mut coordinator = CaptureCoordinator::new(microphone, system);
         let (sink, receiver) = capture_channel(256)?;
+        let clock = sink.clone();
         let mut engine = AudioEngine::new(AudioEngineConfig::default(), selection)?;
         let mut writer = OggOpusWriter::create(&output, OggOpusConfig::default())?;
         writer.begin_run(1)?;
@@ -75,8 +76,10 @@ mod windows_probe {
             "Capturing for {seconds} seconds. Output: {}",
             output.display()
         );
+        let capture_duration = Duration::from_secs(seconds);
         let capture_result = capture_until(
-            Instant::now() + Duration::from_secs(seconds),
+            capture_duration,
+            &clock,
             &receiver,
             &mut coordinator,
             &mut engine,
@@ -85,6 +88,7 @@ mod windows_probe {
         let stop_result = coordinator.stop();
         capture_result?;
         stop_result?;
+        engine.flush_to(capture_duration)?;
 
         while let Some(frame) = engine.pop_recorder() {
             writer.write_pcm(frame.samples())?;
@@ -123,13 +127,14 @@ mod windows_probe {
     }
 
     fn capture_until(
-        deadline: Instant,
+        capture_duration: Duration,
+        clock: &aimeeting_lib::audio::capture::CaptureFrameSink,
         receiver: &std::sync::mpsc::Receiver<aimeeting_lib::audio::frame::AudioFrame>,
         coordinator: &mut CaptureCoordinator,
         engine: &mut AudioEngine,
         writer: &mut OggOpusWriter,
     ) -> Result<(), Box<dyn Error>> {
-        while Instant::now() < deadline {
+        while clock.elapsed() < capture_duration {
             match receiver.recv_timeout(Duration::from_millis(50)) {
                 Ok(frame) => engine.ingest(frame)?,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -137,6 +142,7 @@ mod windows_probe {
                     return Err("capture callback channel disconnected".into());
                 }
             }
+            engine.advance_to(clock.elapsed())?;
 
             while let Some(frame) = engine.pop_recorder() {
                 writer.write_pcm(frame.samples())?;

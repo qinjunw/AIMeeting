@@ -147,6 +147,7 @@ fn engine(selection: SourceSelection, recorder_samples: usize, asr_samples: usiz
             output_frame_samples: 2,
             recorder_capacity_samples: recorder_samples,
             asr_capacity_samples: asr_samples,
+            alignment_latency: Duration::ZERO,
             silence_rms_threshold: 0.001,
             silence_warning_after: Duration::from_millis(40),
             mixer: MixerConfig {
@@ -172,6 +173,9 @@ fn engine_supports_microphone_system_and_mixed_source_combinations() {
     microphone_only
         .ingest(system_frame.clone())
         .expect("disabled system ignored");
+    microphone_only
+        .advance_to(Duration::from_millis(20))
+        .expect("advance microphone timeline");
     assert_eq!(
         microphone_only.pop_recorder().unwrap().samples(),
         &[0.75, 0.25]
@@ -180,13 +184,96 @@ fn engine_supports_microphone_system_and_mixed_source_combinations() {
 
     let mut system_only = engine(SourceSelection::system_only(), 2, 2);
     system_only.ingest(system_frame.clone()).expect("system");
+    system_only
+        .advance_to(Duration::from_millis(20))
+        .expect("advance system timeline");
     assert_eq!(system_only.pop_recorder().unwrap().samples(), &[0.5, 0.5]);
 
     let mut mixed = engine(SourceSelection::mixed(), 2, 2);
     mixed.ingest(microphone_frame).expect("buffer microphone");
     assert!(mixed.pop_recorder().is_none());
     mixed.ingest(system_frame).expect("mix system");
+    mixed
+        .advance_to(Duration::from_millis(20))
+        .expect("advance mixed timeline");
     assert_eq!(mixed.pop_recorder().unwrap().samples(), &[1.0, 0.75]);
+}
+
+#[test]
+fn mixed_timeline_keeps_recording_when_system_loopback_is_idle() {
+    let mut engine = engine(SourceSelection::mixed(), 8, 8);
+    engine
+        .ingest(frame(AudioSource::Microphone, 0, vec![0.4, 0.2]))
+        .expect("microphone frame");
+
+    engine
+        .advance_to(Duration::from_millis(40))
+        .expect("advance through missing system audio");
+
+    assert_eq!(engine.pop_recorder().unwrap().samples(), &[0.4, 0.2]);
+    assert_eq!(engine.pop_recorder().unwrap().samples(), &[0.0, 0.0]);
+    assert!(engine.pop_recorder().is_none());
+}
+
+#[test]
+fn delayed_system_audio_is_aligned_to_its_wall_clock_slot() {
+    let mut engine = engine(SourceSelection::mixed(), 12, 12);
+    for (timestamp, samples) in [
+        (0, vec![0.1, 0.1]),
+        (20, vec![0.2, 0.2]),
+        (40, vec![0.3, 0.3]),
+    ] {
+        engine
+            .ingest(frame(AudioSource::Microphone, timestamp, samples))
+            .expect("microphone frame");
+    }
+    engine
+        .ingest(frame(AudioSource::System, 40, vec![0.5, 0.5]))
+        .expect("delayed system frame");
+
+    engine
+        .advance_to(Duration::from_millis(60))
+        .expect("advance aligned timeline");
+
+    assert_eq!(engine.pop_recorder().unwrap().samples(), &[0.1, 0.1]);
+    assert_eq!(engine.pop_recorder().unwrap().samples(), &[0.2, 0.2]);
+    assert_eq!(engine.pop_recorder().unwrap().samples(), &[0.8, 0.8]);
+}
+
+#[test]
+fn system_only_timeline_emits_duration_preserving_silence_without_callbacks() {
+    let mut engine = engine(SourceSelection::system_only(), 6, 6);
+
+    engine
+        .advance_to(Duration::from_millis(40))
+        .expect("advance silent system timeline");
+
+    assert_eq!(engine.pop_recorder().unwrap().samples(), &[0.0, 0.0]);
+    assert_eq!(engine.pop_recorder().unwrap().samples(), &[0.0, 0.0]);
+    assert!(engine.pop_recorder().is_none());
+}
+
+#[test]
+fn system_loopback_resumes_in_its_wall_clock_slot_after_a_silent_gap() {
+    let mut engine = engine(SourceSelection::system_only(), 12, 12);
+    engine
+        .ingest(frame(AudioSource::System, 0, vec![0.5, 0.5]))
+        .expect("first playback");
+    engine
+        .advance_to(Duration::from_millis(100))
+        .expect("fill silent gap");
+    engine
+        .ingest(frame(AudioSource::System, 100, vec![0.7, 0.7]))
+        .expect("resumed playback");
+    engine
+        .advance_to(Duration::from_millis(120))
+        .expect("emit resumed playback");
+
+    assert_eq!(engine.pop_recorder().unwrap().samples(), &[0.5, 0.5]);
+    for _ in 0..4 {
+        assert_eq!(engine.pop_recorder().unwrap().samples(), &[0.0, 0.0]);
+    }
+    assert_eq!(engine.pop_recorder().unwrap().samples(), &[0.7, 0.7]);
 }
 
 #[test]
@@ -197,7 +284,13 @@ fn asr_saturation_drops_only_asr_frames_and_preserves_recorder_frames() {
         .ingest(frame(AudioSource::Microphone, 0, vec![0.1, 0.2]))
         .expect("first frame");
     engine
+        .advance_to(Duration::from_millis(20))
+        .expect("fill recorder queue");
+    engine
         .ingest(frame(AudioSource::Microphone, 20, vec![0.3, 0.4]))
+        .expect("ASR congestion must not fail recording");
+    engine
+        .advance_to(Duration::from_millis(40))
         .expect("ASR congestion must not fail recording");
 
     assert_eq!(engine.pop_recorder().unwrap().samples(), &[0.1, 0.2]);
@@ -216,9 +309,15 @@ fn recorder_saturation_is_an_explicit_fatal_engine_error() {
     engine
         .ingest(frame(AudioSource::Microphone, 0, vec![0.1, 0.2]))
         .expect("first frame");
+    engine
+        .advance_to(Duration::from_millis(20))
+        .expect("fill recorder queue");
 
-    let error = engine
+    engine
         .ingest(frame(AudioSource::Microphone, 20, vec![0.3, 0.4]))
+        .expect("buffer second frame");
+    let error = engine
+        .advance_to(Duration::from_millis(40))
         .expect_err("recorder congestion must be explicit");
 
     assert!(matches!(error, AudioEngineError::RecorderQueueFull { .. }));

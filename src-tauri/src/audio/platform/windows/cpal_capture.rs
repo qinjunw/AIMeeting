@@ -1,6 +1,6 @@
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, DeviceId, ErrorKind, SampleFormat, Stream, SupportedStreamConfig};
@@ -211,7 +211,6 @@ fn build_stream(
 ) -> Result<Stream, CaptureError> {
     let sample_rate = config.sample_rate();
     let channels = config.channels();
-    let started = Instant::now();
     let stream_config = config.into();
 
     let stream = match config.sample_format() {
@@ -223,7 +222,6 @@ fn build_stream(
                     emit_frame(
                         NativeSamples::F32(data),
                         kind,
-                        started,
                         sample_rate,
                         channels,
                         &sink,
@@ -242,7 +240,6 @@ fn build_stream(
                     emit_frame(
                         NativeSamples::I16(data),
                         kind,
-                        started,
                         sample_rate,
                         channels,
                         &sink,
@@ -261,7 +258,6 @@ fn build_stream(
                     emit_frame(
                         NativeSamples::U16(data),
                         kind,
-                        started,
                         sample_rate,
                         channels,
                         &sink,
@@ -281,15 +277,21 @@ fn build_stream(
 fn emit_frame(
     samples: NativeSamples<'_>,
     kind: CaptureSourceKind,
-    started: Instant,
     sample_rate: u32,
     channels: u16,
     sink: &CaptureFrameSink,
     callback_error: &Arc<Mutex<Option<String>>>,
 ) {
+    let sample_count = match &samples {
+        NativeSamples::F32(samples) => samples.len(),
+        NativeSamples::I16(samples) => samples.len(),
+        NativeSamples::U16(samples) => samples.len(),
+    };
+    let sample_frames = sample_count / channels as usize;
+    let frame_duration = Duration::from_secs_f64(sample_frames as f64 / sample_rate as f64);
     let frame = AudioFrame::new(
         kind.audio_source(),
-        started.elapsed(),
+        sink.elapsed().saturating_sub(frame_duration),
         sample_rate,
         channels,
         convert_samples_to_f32(samples),

@@ -1,4 +1,5 @@
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
@@ -107,6 +108,7 @@ pub fn convert_samples_to_f32(samples: NativeSamples<'_>) -> Vec<f32> {
 #[derive(Clone)]
 pub struct CaptureFrameSink {
     sender: SyncSender<AudioFrame>,
+    started: Instant,
 }
 
 impl CaptureFrameSink {
@@ -115,6 +117,10 @@ impl CaptureFrameSink {
             TrySendError::Full(_) => CaptureError::CallbackQueueFull,
             TrySendError::Disconnected(_) => CaptureError::CallbackReceiverDisconnected,
         })
+    }
+
+    pub fn elapsed(&self) -> Duration {
+        self.started.elapsed()
     }
 }
 
@@ -125,7 +131,13 @@ pub fn capture_channel(
         return Err(CaptureError::ZeroCallbackQueueCapacity);
     }
     let (sender, receiver) = sync_channel(capacity_frames);
-    Ok((CaptureFrameSink { sender }, receiver))
+    Ok((
+        CaptureFrameSink {
+            sender,
+            started: Instant::now(),
+        },
+        receiver,
+    ))
 }
 
 pub trait AudioCaptureSource: Send {
