@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::jobs::{JobError, JobKind, PersistentJob, SqliteJobStore};
+use crate::jobs::{JobError, JobKind, JobStatus, NewPersistentJob, PersistentJob, SqliteJobStore};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -86,6 +86,41 @@ pub fn processing_job_status(
     store
         .list_for_meeting(&request.meeting_id)
         .map(|jobs| jobs.into_iter().map(Into::into).collect())
+}
+
+pub fn retry_or_enqueue(
+    store: &mut SqliteJobStore,
+    kind: JobKind,
+    request: RetryJobRequest,
+) -> Result<ProcessingJobStatus, JobError> {
+    if let Some(active) = store
+        .list_for_meeting(&request.meeting_id)?
+        .into_iter()
+        .find(|job| {
+            job.kind == kind && matches!(job.status, JobStatus::Queued | JobStatus::Running)
+        })
+    {
+        return Ok(active.into());
+    }
+    match retry(store, kind, request.clone()) {
+        Ok(job) => Ok(job),
+        Err(JobError::NotFound(_)) => {
+            let job = NewPersistentJob::new(
+                uuid::Uuid::new_v4().to_string(),
+                &request.meeting_id,
+                kind,
+                request.input_revision,
+                &request.requested_at,
+            );
+            let job_id = job.id.clone();
+            store.enqueue(job)?;
+            store
+                .job(&job_id)?
+                .ok_or(JobError::NotFound(job_id))
+                .map(Into::into)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn retry(

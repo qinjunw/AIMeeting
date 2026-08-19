@@ -34,6 +34,8 @@ pub fn run() {
                 desktop.paths.database_path().to_path_buf(),
             ));
             app.manage(desktop);
+            runtime::transcription::install(app.handle());
+            runtime::processing::recover_and_spawn(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

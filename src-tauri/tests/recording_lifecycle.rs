@@ -151,3 +151,28 @@ fn registry_rejects_a_second_active_meeting_without_touching_the_first() {
     assert_eq!(registry.active().unwrap().meeting_id, "meeting-1");
     registry.stop("meeting-1").expect("cleanup");
 }
+
+#[test]
+fn native_recording_emits_bounded_pcm16_packets_for_asr() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("recording.opus");
+    let mut registry = registry();
+    let (asr_tx, mut asr_rx) = tokio::sync::mpsc::channel(8);
+
+    registry
+        .start_with_asr(
+            "meeting-asr".to_string(),
+            1,
+            SourceSelection::microphone_only(),
+            path,
+            Some(asr_tx),
+        )
+        .expect("start with ASR");
+    std::thread::sleep(Duration::from_millis(140));
+    registry.stop("meeting-asr").expect("stop");
+
+    let packet = asr_rx.try_recv().expect("100 ms PCM16 packet");
+    assert_eq!(packet.len(), 3_200);
+    assert_eq!(packet.len() % 2, 0);
+    assert!(packet.chunks_exact(2).any(|sample| sample != [0, 0]));
+}

@@ -23,7 +23,7 @@ struct StreamingAsrSessionHandle {
     audio_tx: mpsc::Sender<StreamingAsrCommand>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct StreamingAsrState {
     sessions: Arc<Mutex<HashMap<String, StreamingAsrSessionHandle>>>,
 }
@@ -37,6 +37,15 @@ struct StreamingAsrSession {
     model: String,
     language: String,
     provider_label: String,
+}
+
+pub(crate) struct NativeStreamingAsrConfig {
+    pub cloud_base_url: String,
+    pub cloud_api_key: String,
+    pub cloud_model: String,
+    pub language: String,
+    pub meeting_id: String,
+    pub recording_run_id: String,
 }
 
 enum StreamingAsrCommand {
@@ -184,6 +193,57 @@ pub(crate) async fn start_streaming_asr_session(
             Err("实时 ASR 等待 task-started 超时。".to_string())
         }
     }
+}
+
+pub(crate) async fn run_native_streaming_asr_bridge(
+    app: AppHandle,
+    state: StreamingAsrState,
+    config: NativeStreamingAsrConfig,
+    mut audio_rx: mpsc::Receiver<Vec<u8>>,
+) {
+    let response = start_streaming_asr_session(
+        app,
+        &state,
+        StartStreamingAsrRequest {
+            cloud_base_url: config.cloud_base_url,
+            cloud_api_key: config.cloud_api_key,
+            cloud_model: config.cloud_model,
+            language: config.language,
+            meeting_id: config.meeting_id,
+            recording_run_id: config.recording_run_id,
+        },
+    )
+    .await;
+    let Ok(response) = response else {
+        return;
+    };
+
+    while let Some(audio) = audio_rx.recv().await {
+        let audio_tx = {
+            let sessions = state.sessions.lock().await;
+            sessions
+                .get(&response.session_id)
+                .map(|session| session.audio_tx.clone())
+        };
+        let Some(audio_tx) = audio_tx else {
+            return;
+        };
+        if audio_tx
+            .send(StreamingAsrCommand::Audio(audio))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+
+    let _ = finish_streaming_asr_session(
+        &state,
+        StreamingAsrSessionRequest {
+            session_id: response.session_id,
+        },
+    )
+    .await;
 }
 
 pub(crate) async fn push_streaming_asr_audio(

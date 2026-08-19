@@ -1,4 +1,6 @@
+pub mod processing;
 pub mod registry;
+pub mod transcription;
 
 use std::path::Path;
 use std::sync::Mutex;

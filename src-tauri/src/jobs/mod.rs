@@ -4,7 +4,7 @@ pub use runner::{JobHandler, JobRunner};
 
 use std::path::Path;
 
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{params, Connection, OptionalExtension, Row, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -170,7 +170,23 @@ impl SqliteJobStore {
     }
 
     pub fn enqueue(&mut self, job: NewPersistentJob) -> Result<EnqueueDisposition, JobError> {
-        let transaction = self.connection.transaction()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if job.kind == JobKind::FileTranscription {
+            let active_exists: bool = transaction.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM processing_jobs
+                    WHERE meeting_id = ?1 AND job_type = 'file_transcription'
+                      AND status IN ('queued', 'running')
+                 )",
+                params![job.meeting_id],
+                |row| row.get(0),
+            )?;
+            if active_exists {
+                return Ok(EnqueueDisposition::Coalesced);
+            }
+        }
         if job.kind == JobKind::Minutes {
             let revision = required_revision(&job.id, job.input_revision)?;
             let newest: Option<i64> = transaction
@@ -250,6 +266,42 @@ impl SqliteJobStore {
         }
         transaction.commit()?;
         Ok(claimed)
+    }
+
+    pub fn recover_interrupted(&mut self, updated_at: &str) -> Result<usize, JobError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let interrupted = {
+            let mut statement = transaction.prepare(
+                "SELECT meeting_id, job_type FROM processing_jobs WHERE status = 'running'",
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        let recovered = transaction.execute(
+            "UPDATE processing_jobs
+             SET status = 'queued',
+                 error_summary = '应用上次退出时任务中断，已自动重新排队。',
+                 updated_at = ?1
+             WHERE status = 'running'",
+            params![updated_at],
+        )?;
+        for (meeting_id, kind) in interrupted {
+            set_meeting_job_state(
+                &transaction,
+                &meeting_id,
+                JobKind::parse(&kind)?,
+                "pending",
+                updated_at,
+            )?;
+        }
+        transaction.commit()?;
+        Ok(recovered)
     }
 
     pub fn job(&self, job_id: &str) -> Result<Option<PersistentJob>, JobError> {

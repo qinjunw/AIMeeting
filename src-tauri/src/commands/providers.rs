@@ -295,6 +295,25 @@ where
         Ok(ResolvedProviderProfile { profile, api_key })
     }
 
+    pub fn resolve_default(
+        &self,
+        capability: ProviderCapability,
+    ) -> Result<Option<ResolvedProviderProfile>, ProviderError> {
+        let profiles = self.repository.list()?;
+        let profile_id = profiles
+            .iter()
+            .find(|profile| profile.capability == capability && profile.is_default)
+            .or_else(|| {
+                profiles
+                    .iter()
+                    .find(|profile| profile.capability == capability)
+            })
+            .map(|profile| profile.id.clone());
+        profile_id
+            .map(|profile_id| self.resolve(&profile_id))
+            .transpose()
+    }
+
     fn to_dto(&self, profile: StoredProviderProfile) -> Result<ProviderProfileDto, ProviderError> {
         let has_secret = match profile.secret_reference.as_deref() {
             Some(reference) => self.secrets.read(reference)?.is_some(),
@@ -473,6 +492,13 @@ impl ProviderState {
             SqliteProviderProfileRepository::open(&self.database_path)?,
             PlatformSecretStore::default(),
         ))
+    }
+
+    pub(crate) fn resolve_default(
+        &self,
+        capability: ProviderCapability,
+    ) -> Result<Option<ResolvedProviderProfile>, ProviderError> {
+        self.service()?.resolve_default(capability)
     }
 }
 

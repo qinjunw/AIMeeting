@@ -4,6 +4,7 @@ version = "0.1.2"
 description = "Windows-first realtime meeting copilot prototype"
 authors = ["AIMeeting"]
 edition = "2021"
+default-run = "aimeeting"
 
 [lib]
 name = "aimeeting_lib"

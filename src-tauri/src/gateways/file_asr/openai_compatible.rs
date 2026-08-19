@@ -2,7 +2,37 @@ use base64::Engine;
 use reqwest::multipart;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::path::Path;
 use std::time::Duration;
+
+pub(crate) struct FileTranscriptionConfig {
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    pub language: String,
+}
+
+pub(crate) async fn transcribe_audio_file(
+    path: &Path,
+    config: FileTranscriptionConfig,
+) -> Result<String, String> {
+    let audio = std::fs::read(path).map_err(|error| format!("无法读取本地录音文件：{error}"))?;
+    if audio.is_empty() {
+        return Err("本地录音文件为空。".to_string());
+    }
+    transcribe_with_cloud(
+        &TranscribeAudioRequest {
+            audio_base64: String::new(),
+            mime_type: "audio/ogg".to_string(),
+            cloud_base_url: config.base_url,
+            cloud_api_key: config.api_key,
+            cloud_model: config.model,
+            language: config.language,
+        },
+        audio,
+    )
+    .await
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]

@@ -12,6 +12,9 @@ use crate::audio::capture::{
 use crate::audio::engine::{AudioEngine, AudioEngineConfig};
 use crate::audio::ogg_opus::{OggOpusConfig, OggOpusWriter};
 use crate::audio::platform::windows::default_capture_source;
+use crate::audio::resampler::StreamingLinearResampler;
+
+pub type NativeAsrAudioSender = tokio::sync::mpsc::Sender<Vec<u8>>;
 
 const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
@@ -80,6 +83,17 @@ impl RecordingRegistry {
         selection: SourceSelection,
         audio_path: PathBuf,
     ) -> Result<ActiveRecordingSnapshot, String> {
+        self.start_with_asr(meeting_id, generation, selection, audio_path, None)
+    }
+
+    pub fn start_with_asr(
+        &mut self,
+        meeting_id: String,
+        generation: u64,
+        selection: SourceSelection,
+        audio_path: PathBuf,
+        asr_audio_tx: Option<NativeAsrAudioSender>,
+    ) -> Result<ActiveRecordingSnapshot, String> {
         if self.active.is_some() {
             return Err("已有会议正在录音，请先暂停或结束当前会议。".to_string());
         }
@@ -102,6 +116,7 @@ impl RecordingRegistry {
                     worker_path,
                     generation,
                     selection,
+                    asr_audio_tx,
                     command_rx,
                     startup_tx,
                 )
@@ -270,6 +285,7 @@ fn recording_worker(
     audio_path: PathBuf,
     initial_generation: u64,
     initial_selection: SourceSelection,
+    asr_audio_tx: Option<NativeAsrAudioSender>,
     command_rx: Receiver<ControlCommand>,
     startup_tx: mpsc::SyncSender<Result<(), String>>,
 ) -> Result<RecordingCheckpoint, String> {
@@ -287,6 +303,7 @@ fn recording_worker(
         &mut writer,
         initial_generation,
         initial_selection,
+        asr_audio_tx.clone(),
     ) {
         Ok(run) => run,
         Err(error) => {
@@ -318,8 +335,13 @@ fn recording_worker(
                     return Err(error);
                 }
                 let _ = reply.send(Ok(checkpoint));
-                let next =
-                    wait_while_paused(factory.as_ref(), &mut writer, &mut checkpoint, &command_rx)?;
+                let next = wait_while_paused(
+                    factory.as_ref(),
+                    &mut writer,
+                    &mut checkpoint,
+                    &command_rx,
+                    asr_audio_tx.clone(),
+                )?;
                 match next {
                     PausedExit::Resumed(resumed) => run = *resumed,
                     PausedExit::Stopped => {
@@ -354,6 +376,7 @@ fn wait_while_paused(
     writer: &mut OggOpusWriter,
     checkpoint: &mut RecordingCheckpoint,
     command_rx: &Receiver<ControlCommand>,
+    asr_audio_tx: Option<NativeAsrAudioSender>,
 ) -> Result<PausedExit, String> {
     loop {
         match command_rx
@@ -367,15 +390,18 @@ fn wait_while_paused(
                 generation,
                 selection,
                 reply,
-            } => match ActiveRun::start(factory, writer, generation, selection) {
-                Ok(run) => {
-                    let _ = reply.send(Ok(*checkpoint));
-                    return Ok(PausedExit::Resumed(Box::new(run)));
+            } => {
+                match ActiveRun::start(factory, writer, generation, selection, asr_audio_tx.clone())
+                {
+                    Ok(run) => {
+                        let _ = reply.send(Ok(*checkpoint));
+                        return Ok(PausedExit::Resumed(Box::new(run)));
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                    }
                 }
-                Err(error) => {
-                    let _ = reply.send(Err(error));
-                }
-            },
+            }
             ControlCommand::Stop { reply } => {
                 let _ = reply.send(Ok(*checkpoint));
                 return Ok(PausedExit::Stopped);
@@ -389,6 +415,9 @@ struct ActiveRun {
     receiver: Receiver<crate::audio::frame::AudioFrame>,
     clock: crate::audio::capture::CaptureFrameSink,
     engine: AudioEngine,
+    asr_audio_tx: Option<NativeAsrAudioSender>,
+    asr_resampler: StreamingLinearResampler,
+    asr_pcm_buffer: Vec<u8>,
 }
 
 impl ActiveRun {
@@ -397,6 +426,7 @@ impl ActiveRun {
         writer: &mut OggOpusWriter,
         generation: u64,
         selection: SourceSelection,
+        asr_audio_tx: Option<NativeAsrAudioSender>,
     ) -> Result<Self, String> {
         let microphone =
             source_if_enabled(factory, selection.microphone, CaptureSourceKind::Microphone)?;
@@ -406,6 +436,8 @@ impl ActiveRun {
         let clock = sink.clone();
         let engine = AudioEngine::new(AudioEngineConfig::default(), selection)
             .map_err(|error| error.to_string())?;
+        let asr_resampler =
+            StreamingLinearResampler::new(48_000, 16_000).map_err(|error| error.to_string())?;
         let serial =
             u32::try_from(generation).map_err(|_| "录音分段序号超出 Ogg 支持范围。".to_string())?;
         writer
@@ -420,6 +452,9 @@ impl ActiveRun {
             receiver,
             clock,
             engine,
+            asr_audio_tx,
+            asr_resampler,
+            asr_pcm_buffer: Vec::with_capacity(3_200),
         })
     }
 
@@ -437,7 +472,7 @@ impl ActiveRun {
         self.engine
             .advance_to(self.clock.elapsed())
             .map_err(|error| error.to_string())?;
-        drain_recorder(&mut self.engine, writer)?;
+        self.drain_outputs(writer, false)?;
         if let Some((kind, error)) = self.coordinator.source_errors().into_iter().next() {
             return Err(format!("{kind:?} 采集失败：{error}"));
         }
@@ -458,11 +493,38 @@ impl ActiveRun {
         self.engine
             .flush_to(self.clock.elapsed())
             .map_err(|error| error.to_string())?;
-        drain_recorder(&mut self.engine, writer)?;
+        self.drain_outputs(writer, true)?;
         let summary = writer.finish_run().map_err(|error| error.to_string())?;
         checkpoint.completed_runs += 1;
         checkpoint.recorded_samples += summary.input_samples;
         Ok(())
+    }
+
+    fn drain_outputs(&mut self, writer: &mut OggOpusWriter, flush_asr: bool) -> Result<(), String> {
+        while let Some(frame) = self.engine.pop_recorder() {
+            writer
+                .write_pcm(frame.samples())
+                .map_err(|error| error.to_string())?;
+        }
+        while let Some(frame) = self.engine.pop_asr() {
+            let samples = self.asr_resampler.process(frame.samples());
+            self.asr_pcm_buffer.extend(pcm16_le_bytes(&samples));
+            while self.asr_pcm_buffer.len() >= 3_200 {
+                let packet = self.asr_pcm_buffer.drain(..3_200).collect();
+                self.send_asr_packet(packet);
+            }
+        }
+        if flush_asr && !self.asr_pcm_buffer.is_empty() {
+            let packet = std::mem::take(&mut self.asr_pcm_buffer);
+            self.send_asr_packet(packet);
+        }
+        Ok(())
+    }
+
+    fn send_asr_packet(&self, packet: Vec<u8>) {
+        if let Some(sender) = self.asr_audio_tx.as_ref() {
+            let _ = sender.try_send(packet);
+        }
     }
 }
 
@@ -478,14 +540,13 @@ fn source_if_enabled(
     }
 }
 
-fn drain_recorder(engine: &mut AudioEngine, writer: &mut OggOpusWriter) -> Result<(), String> {
-    while let Some(frame) = engine.pop_recorder() {
-        writer
-            .write_pcm(frame.samples())
-            .map_err(|error| error.to_string())?;
+fn pcm16_le_bytes(samples: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(samples.len() * 2);
+    for sample in samples {
+        let value = (sample.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
+        bytes.extend_from_slice(&value.to_le_bytes());
     }
-    while engine.pop_asr().is_some() {}
-    Ok(())
+    bytes
 }
 
 pub fn recording_file_size(path: &Path) -> Result<u64, String> {

@@ -5,7 +5,7 @@ mod recording;
 
 use chrono::Utc;
 use jobs::{JobState, ProcessingJobStatus, ProcessingJobStatusRequest, RetryJobRequest};
-use tauri::State;
+use tauri::{AppHandle, State};
 
 pub(crate) use meetings::{
     get_meeting, get_meeting_detail, list_meetings, list_trash, permanently_delete_meetings,
@@ -30,36 +30,67 @@ pub(crate) fn list_processing_jobs(
 
 #[tauri::command]
 pub(crate) fn retry_transcription(
+    app: AppHandle,
     state: State<'_, JobState>,
+    desktop: State<'_, crate::runtime::DesktopState>,
     request: jobs::DesktopRetryJobRequest,
 ) -> Result<ProcessingJobStatus, String> {
     let mut store = state.store().map_err(|error| error.to_string())?;
-    jobs::retry_transcription(
+    let revision = desktop
+        .repository
+        .lock()
+        .map_err(|error| format!("应用内部状态锁不可用：{error}"))?
+        .latest_transcript_revision(&request.meeting_id)
+        .map_err(|error| error.to_string())?
+        + 1;
+    let status = jobs::retry_or_enqueue(
         &mut store,
+        crate::jobs::JobKind::FileTranscription,
         RetryJobRequest {
             meeting_id: request.meeting_id,
-            input_revision: request.transcript_revision,
+            input_revision: Some(
+                u64::try_from(revision).map_err(|_| "转写版本号无效。".to_string())?,
+            ),
             requested_at: Utc::now().to_rfc3339(),
         },
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    crate::runtime::processing::spawn(app);
+    Ok(status)
 }
 
 #[tauri::command]
 pub(crate) fn retry_minutes(
+    app: AppHandle,
     state: State<'_, JobState>,
+    desktop: State<'_, crate::runtime::DesktopState>,
     request: jobs::DesktopRetryJobRequest,
 ) -> Result<ProcessingJobStatus, String> {
     let mut store = state.store().map_err(|error| error.to_string())?;
-    jobs::retry_minutes(
+    let revision = match request.transcript_revision {
+        Some(revision) => revision,
+        None => u64::try_from(
+            desktop
+                .repository
+                .lock()
+                .map_err(|error| format!("应用内部状态锁不可用：{error}"))?
+                .latest_transcript_revision(&request.meeting_id)
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|_| "转写版本号无效。".to_string())?,
+    };
+    let status = jobs::retry_or_enqueue(
         &mut store,
+        crate::jobs::JobKind::Minutes,
         RetryJobRequest {
             meeting_id: request.meeting_id,
-            input_revision: request.transcript_revision,
+            input_revision: Some(revision),
             requested_at: Utc::now().to_rfc3339(),
         },
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    crate::runtime::processing::spawn(app);
+    Ok(status)
 }
 
 use crate::gateways::{
@@ -70,8 +101,6 @@ use crate::gateways::{
     },
 };
 use serde::Serialize;
-use tauri::AppHandle;
-
 #[derive(Serialize)]
 pub(crate) struct CaptureCapabilities {
     platform: String,

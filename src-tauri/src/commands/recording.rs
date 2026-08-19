@@ -4,6 +4,11 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::audio::capture::{AudioDeviceInfo, SourceSelection};
 use crate::audio::platform::windows::enumerate_audio_devices;
+use crate::commands::providers::{EndpointFlavor, ProviderState};
+use crate::domain::ProviderCapability;
+use crate::gateways::live_asr::dashscope::{
+    run_native_streaming_asr_bridge, NativeStreamingAsrConfig, StreamingAsrState,
+};
 use crate::persistence::NewMeetingRecord;
 use crate::runtime::registry::{recording_file_size, ActiveRecordingSnapshot, RecordingCheckpoint};
 use crate::runtime::DesktopState;
@@ -59,9 +64,21 @@ pub(crate) fn list_audio_devices() -> Result<Vec<AudioDeviceInfo>, String> {
 pub(crate) fn start_recording(
     app: AppHandle,
     state: State<'_, DesktopState>,
+    provider_state: State<'_, ProviderState>,
+    asr_state: State<'_, StreamingAsrState>,
     request: StartRecordingRequest,
 ) -> Result<SessionSnapshot, String> {
     let selection = source_selection(request.sources.microphone, request.sources.system_audio)?;
+    let live_provider = provider_state
+        .resolve_default(ProviderCapability::LiveTranscription)
+        .ok()
+        .flatten()
+        .filter(|provider| provider.profile.endpoint_flavor == EndpointFlavor::RealtimeWebsocket);
+    let transcription_status = if live_provider.is_some() {
+        "pending"
+    } else {
+        "failed"
+    };
     let meeting_id = uuid::Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
     let title = request
@@ -73,7 +90,7 @@ pub(crate) fn start_recording(
         id: meeting_id.clone(),
         title,
         status: "preparing".to_string(),
-        transcription_status: "pending".to_string(),
+        transcription_status: transcription_status.to_string(),
         minutes_status: "pending".to_string(),
         created_at: now.clone(),
     };
@@ -89,11 +106,18 @@ pub(crate) fn start_recording(
         .meeting_dir(&meeting_id)
         .map_err(|error| error.to_string())?;
     let audio_path = meeting_dir.join(RECORDING_FILE_NAME);
-    let start_result = state.recordings.lock().map_err(lock_error)?.start(
+    let (asr_audio_tx, asr_audio_rx) = if live_provider.is_some() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(80);
+        (Some(sender), Some(receiver))
+    } else {
+        (None, None)
+    };
+    let start_result = state.recordings.lock().map_err(lock_error)?.start_with_asr(
         meeting_id.clone(),
         1,
         selection,
         audio_path,
+        asr_audio_tx,
     );
     if let Err(error) = start_result {
         let _ = state
@@ -103,7 +127,7 @@ pub(crate) fn start_recording(
             .update_meeting_states(
                 &meeting_id,
                 "interrupted",
-                "pending",
+                transcription_status,
                 "pending",
                 &Utc::now().to_rfc3339(),
             );
@@ -126,7 +150,13 @@ pub(crate) fn start_recording(
             .upsert_recording_asset(&meeting_id, RECORDING_FILE_NAME, "recording", 0, 0, &now)
             .map_err(|error| error.to_string())?;
         repository
-            .update_meeting_states(&meeting_id, "recording", "pending", "pending", &now)
+            .update_meeting_states(
+                &meeting_id,
+                "recording",
+                transcription_status,
+                "pending",
+                &now,
+            )
             .map_err(|error| error.to_string())
     })();
     if let Err(error) = persist_result {
@@ -136,6 +166,22 @@ pub(crate) fn start_recording(
             .map_err(lock_error)?
             .stop(&meeting_id);
         return Err(error);
+    }
+
+    if let (Some(provider), Some(audio_rx)) = (live_provider, asr_audio_rx) {
+        tauri::async_runtime::spawn(run_native_streaming_asr_bridge(
+            app.clone(),
+            asr_state.inner().clone(),
+            NativeStreamingAsrConfig {
+                cloud_base_url: provider.profile.base_url,
+                cloud_api_key: provider.api_key.expose().to_string(),
+                cloud_model: provider.profile.model,
+                language: "zh-CN".to_string(),
+                meeting_id: meeting_id.clone(),
+                recording_run_id: run_id(&meeting_id, 1),
+            },
+            audio_rx,
+        ));
     }
 
     load_and_emit(&app, &state, &meeting_id, 1)
@@ -158,7 +204,7 @@ pub(crate) fn pause_recording(
         .finish_recording_run(&run_id(&request.meeting_id, snapshot.generation), &now)
         .map_err(|error| error.to_string())?;
     repository
-        .update_meeting_states(&request.meeting_id, "paused", "pending", "pending", &now)
+        .update_recording_status(&request.meeting_id, "paused", &now)
         .map_err(|error| error.to_string())?;
     drop(repository);
     load_and_emit(&app, &state, &request.meeting_id, snapshot.generation)
@@ -200,7 +246,7 @@ pub(crate) fn resume_recording(
         )
         .map_err(|error| error.to_string())?;
     repository
-        .update_meeting_states(&request.meeting_id, "recording", "pending", "pending", &now)
+        .update_recording_status(&request.meeting_id, "recording", &now)
         .map_err(|error| error.to_string())?;
     drop(repository);
     load_and_emit(&app, &state, &request.meeting_id, generation)
@@ -227,6 +273,10 @@ pub(crate) fn stop_recording(
         .map_err(lock_error)?
         .stop(&request.meeting_id)?;
     persist_stopped_recording(&state, &snapshot, checkpoint)?;
+    crate::runtime::processing::enqueue_file_transcription_if_recording_complete(
+        &app,
+        &snapshot.meeting_id,
+    );
     load_and_emit(&app, &state, &request.meeting_id, snapshot.generation)
 }
 
@@ -251,6 +301,15 @@ fn persist_stopped_recording(
     let byte_size = i64::try_from(recording_file_size(&snapshot.audio_path)?)
         .map_err(|_| "录音文件大小超出支持范围。".to_string())?;
     let repository = state.repository.lock().map_err(lock_error)?;
+    let meeting = repository
+        .get_meeting(&snapshot.meeting_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "会议记录不存在。".to_string())?;
+    let transcription_status = if meeting.transcription_status == "streaming" {
+        "processing"
+    } else {
+        meeting.transcription_status.as_str()
+    };
     repository
         .finish_recording_run(&run_id(&snapshot.meeting_id, snapshot.generation), &now)
         .map_err(|error| error.to_string())?;
@@ -265,7 +324,13 @@ fn persist_stopped_recording(
         )
         .map_err(|error| error.to_string())?;
     repository
-        .mark_meeting_stopped(&snapshot.meeting_id, "ready", "pending", "pending", &now)
+        .mark_meeting_stopped(
+            &snapshot.meeting_id,
+            "ready",
+            transcription_status,
+            &meeting.minutes_status,
+            &now,
+        )
         .map_err(|error| error.to_string())
 }
 
@@ -294,6 +359,7 @@ fn session_snapshot(
     let transcript_revision = repository
         .latest_transcript_revision(meeting_id)
         .map_err(|error| error.to_string())?;
+    let transcription_failed = meeting.transcription_status == "failed";
     Ok(SessionSnapshot {
         meeting_id: meeting.id,
         run_generation,
@@ -301,7 +367,8 @@ fn session_snapshot(
         transcript_revision: u64::try_from(transcript_revision)
             .map_err(|_| "转写版本号无效。".to_string())?,
         transcription_status: meeting.transcription_status,
-        transcription_error: None,
+        transcription_error: transcription_failed
+            .then(|| "实时转写暂不可用，录音仍会正常保存。".to_string()),
         minutes_status: meeting.minutes_status,
         minutes_error: None,
     })

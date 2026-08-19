@@ -1,6 +1,7 @@
 import { FileText, RotateCcw, ScrollText } from 'lucide-react'
 
 import type { MeetingDetails } from '../../bridge/meetingRepositoryClient'
+import type { RecordingStatus } from '../../domain/meeting'
 import type { MinutesViewState, TranscriptionViewState } from './useMeetingSession'
 
 export type WorkspaceTab = 'minutes' | 'transcript'
@@ -8,6 +9,7 @@ export type WorkspaceTab = 'minutes' | 'transcript'
 type MeetingWorkspaceProps = {
   meeting: MeetingDetails | null
   activeMeetingId: string | null
+  activeRecordingStatus: RecordingStatus | 'idle'
   transcription: TranscriptionViewState
   minutes: MinutesViewState
   tab: WorkspaceTab
@@ -19,6 +21,7 @@ type MeetingWorkspaceProps = {
 export function MeetingWorkspace({
   meeting,
   activeMeetingId,
+  activeRecordingStatus,
   transcription,
   minutes,
   tab,
@@ -35,6 +38,9 @@ export function MeetingWorkspace({
   const minutesContent = isActiveMeeting && minutes.content ? minutes.content : meeting?.minutes?.content ?? ''
   const transcriptionStatus = isActiveMeeting ? transcription.status : meeting?.transcriptionStatus
   const minutesStatus = isActiveMeeting ? minutes.status : meeting?.minutesStatus
+  const recordingStatus = isActiveMeeting && activeRecordingStatus !== 'idle'
+    ? activeRecordingStatus
+    : meeting?.recordingStatus
 
   return (
     <main className="meeting-workspace">
@@ -43,7 +49,7 @@ export function MeetingWorkspace({
           <span className="workspace-eyebrow">{meeting ? formatDate(meeting.createdAt) : '新会议'}</span>
           <h1>{meeting?.title ?? '准备开始一场会议'}</h1>
         </div>
-        {meeting && <span className={`meeting-status meeting-status--${meeting.recordingStatus}`}>{recordingLabel(meeting.recordingStatus)}</span>}
+        {meeting && recordingStatus && <span className={`meeting-status meeting-status--${recordingStatus}`}>{recordingLabel(recordingStatus)}</span>}
       </header>
 
       {(transcription.error || minutes.error) && isActiveMeeting && (

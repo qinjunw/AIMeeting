@@ -144,6 +144,7 @@ export default function App() {
         <MeetingWorkspace
           meeting={history.selectedMeeting}
           activeMeetingId={session.recording.meetingId}
+          activeRecordingStatus={session.recording.status}
           transcription={session.transcription}
           minutes={session.minutes}
           tab={tab}

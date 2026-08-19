@@ -166,6 +166,55 @@ impl MeetingRepository {
         Ok(())
     }
 
+    pub fn update_transcription_status(
+        &self,
+        meeting_id: &str,
+        status: &str,
+        updated_at: &str,
+    ) -> Result<()> {
+        self.connection.execute(
+            "UPDATE meeting_records SET transcription_status = ?2, updated_at = ?3 WHERE id = ?1",
+            params![meeting_id, status, updated_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_recording_status(
+        &self,
+        meeting_id: &str,
+        status: &str,
+        updated_at: &str,
+    ) -> Result<()> {
+        self.connection.execute(
+            "UPDATE meeting_records SET status = ?2, updated_at = ?3 WHERE id = ?1",
+            params![meeting_id, status, updated_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_minutes_status(
+        &self,
+        meeting_id: &str,
+        status: &str,
+        updated_at: &str,
+    ) -> Result<()> {
+        self.connection.execute(
+            "UPDATE meeting_records SET minutes_status = ?2, updated_at = ?3 WHERE id = ?1",
+            params![meeting_id, status, updated_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn latest_recording_generation(&self, meeting_id: &str) -> Result<i64> {
+        self.connection
+            .query_row(
+                "SELECT COALESCE(MAX(generation), 0) FROM recording_runs WHERE meeting_id = ?1",
+                params![meeting_id],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
     pub fn list_meetings(&self, deleted: bool) -> Result<Vec<MeetingRecordRow>> {
         let predicate = if deleted {
             "deleted_at IS NOT NULL"

@@ -8,8 +8,8 @@ use std::{
 };
 
 use aimeeting_lib::commands::jobs::{
-    processing_job_status, retry_minutes, retry_transcription, ProcessingJobStatusRequest,
-    RetryJobRequest,
+    processing_job_status, retry_minutes, retry_or_enqueue, retry_transcription,
+    ProcessingJobStatusRequest, RetryJobRequest,
 };
 use aimeeting_lib::commands::providers::{
     delete_provider, list_providers, save_provider, test_provider, EndpointFlavor, ProviderError,
@@ -136,6 +136,25 @@ fn provider_default_is_unique_per_capability_and_secret_debug_is_redacted() {
     assert_eq!(format!("{:?}", SecretString::new("private")), "[REDACTED]");
 }
 
+#[test]
+fn retry_command_enqueues_once_when_no_failed_job_exists() {
+    let (_temp, path) = test_database();
+    create_meeting(&path, "meeting-retry");
+    let mut store = SqliteJobStore::open(&path).unwrap();
+    let request = RetryJobRequest {
+        meeting_id: "meeting-retry".to_string(),
+        input_revision: Some(1),
+        requested_at: NOW.to_string(),
+    };
+
+    let first = retry_or_enqueue(&mut store, JobKind::FileTranscription, request.clone()).unwrap();
+    let second = retry_or_enqueue(&mut store, JobKind::FileTranscription, request).unwrap();
+
+    assert_eq!(first.status, JobStatus::Queued);
+    assert_eq!(second.id, first.id);
+    assert_eq!(store.list_for_meeting("meeting-retry").unwrap().len(), 1);
+}
+
 #[tokio::test]
 async fn provider_test_resolves_the_secret_only_inside_the_backend_probe() {
     let (_temp, path) = test_database();
@@ -203,6 +222,65 @@ fn minutes_enqueue_coalesces_older_queued_revisions() {
     let claimed = store.claim_next(JobKind::Minutes, NOW).unwrap().unwrap();
     assert_eq!(claimed.id, "minutes-2");
     assert!(store.claim_next(JobKind::Minutes, NOW).unwrap().is_none());
+}
+
+#[test]
+fn file_transcription_enqueue_coalesces_an_active_job_for_the_same_meeting() {
+    let (_temp, path) = test_database();
+    create_meeting(&path, "meeting-1");
+    let mut store = SqliteJobStore::open(&path).unwrap();
+
+    assert_eq!(
+        store
+            .enqueue(NewPersistentJob::new(
+                "transcribe-first",
+                "meeting-1",
+                JobKind::FileTranscription,
+                Some(1),
+                NOW,
+            ))
+            .unwrap(),
+        EnqueueDisposition::Enqueued
+    );
+    assert_eq!(
+        store
+            .enqueue(NewPersistentJob::new(
+                "transcribe-duplicate",
+                "meeting-1",
+                JobKind::FileTranscription,
+                Some(1),
+                NOW,
+            ))
+            .unwrap(),
+        EnqueueDisposition::Coalesced
+    );
+    assert!(store.job("transcribe-duplicate").unwrap().is_none());
+}
+
+#[test]
+fn startup_requeues_a_job_interrupted_while_running() {
+    let (_temp, path) = test_database();
+    create_meeting(&path, "meeting-1");
+    let mut store = SqliteJobStore::open(&path).unwrap();
+    store
+        .enqueue(NewPersistentJob::new(
+            "transcribe-interrupted",
+            "meeting-1",
+            JobKind::FileTranscription,
+            Some(1),
+            NOW,
+        ))
+        .unwrap();
+    let running = store
+        .claim_next(JobKind::FileTranscription, NOW)
+        .unwrap()
+        .unwrap();
+    assert_eq!(running.status, JobStatus::Running);
+
+    assert_eq!(store.recover_interrupted(NOW).unwrap(), 1);
+    let recovered = store.job("transcribe-interrupted").unwrap().unwrap();
+    assert_eq!(recovered.status, JobStatus::Queued);
+    assert!(recovered.error_summary.is_some());
 }
 
 #[tokio::test]
