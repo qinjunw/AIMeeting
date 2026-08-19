@@ -11,6 +11,14 @@ node_modules
 dist
 dist-ssr
 *.local
+.env
+.env.*
+!.env.example
+coverage
+test-results
+playwright-report
+release-staging
+soak-output
 src-tauri/target
 
 # Editor directories and files

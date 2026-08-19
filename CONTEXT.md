@@ -24,21 +24,53 @@ The current on-screen text shown from Interim ASR Results while a Recording Run 
 
 The user-facing, incrementally updated meeting note. It is generated from meeting transcript memory by a text model and may lightly rewrite earlier wording to merge repetition, fix obvious recognition errors, and preserve confirmed facts.
 
-## Meeting
+## Meeting Record
 
-An isolated meeting record with its own Raw ASR Segments, Meeting Digest, Copilot responses, and lifecycle state. Stopping a Meeting archives it; starting again creates a separate Meeting whose Copilot context does not include archived Meetings by default.
+A local record of one meeting, including its audio, transcript, Meeting Digest, and lifecycle state. A Meeting Record may exist without any remote Meeting Room.
 
 ## Recording Run
 
-A continuous microphone capture interval inside a Meeting. Pausing ends the current Recording Run but keeps the Meeting open, so later recording continues the same Meeting.
+A continuous audio-capture interval inside a Meeting Record. Pausing ends the current Recording Run while keeping the Meeting Record open for later continuation.
 
 ## Finalization
 
 The background work after microphone capture stops. It lets pending ASR chunks finish, merges their transcript into the owning Meeting, and runs the final Meeting Digest update when a text model is configured.
 
-## Archived Meeting
+## Archived Meeting Record
 
-A Meeting whose user-facing recording has ended. It may briefly be finalizing before becoming archived; late ASR or digest results must update that Meeting only, never the next active Meeting.
+A Meeting Record whose user-facing recording has ended. It may briefly be finalizing before becoming archived; late ASR or digest results belong only to that Meeting Record.
+
+## Meeting Room
+
+A future remote space that participants join with a matching code. A Meeting Room coordinates participants but is not itself a local recording or transcript.
+
+## Room Participant
+
+A user or device that has joined a Meeting Room.
+
+## Room Gateway
+
+The product boundary through which a client may later create, join, leave, and observe a Meeting Room. The current product does not require a remote Room Gateway implementation.
+
+## Audio Source
+
+One independently controlled input to a Recording Run. Windows V1 supports a microphone source and a whole-system loopback source.
+
+## Mixed Recording
+
+The single user-facing audio asset produced after enabled Audio Sources are normalized and mixed. Internal recovery parts may exist while recording, but a completed Meeting Record exposes one playable recording.
+
+## Transcription Job
+
+A persistent background attempt to turn a live stream or saved Mixed Recording into transcript revisions. Its failure never invalidates the underlying recording.
+
+## AI Gateway
+
+The application-facing boundary for live transcription, file transcription, and meeting-minutes generation. Individual providers implement only the capabilities they actually support.
+
+## Recycle Bin
+
+The soft-deleted state and storage area for Meeting Records. Audio, transcript, and minutes remain recoverable until the user explicitly deletes them permanently or empties the Recycle Bin.
 
 ## Wake Phrase
 
