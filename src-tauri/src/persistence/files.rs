@@ -52,6 +52,14 @@ impl DataPaths {
         std::fs::rename(source, destination)?;
         Ok(())
     }
+
+    pub fn permanently_delete_from_trash(&self, meeting_id: &str) -> Result<()> {
+        let path = self.trash_dir(meeting_id)?;
+        if path.exists() {
+            std::fs::remove_dir_all(path)?;
+        }
+        Ok(())
+    }
 }
 
 fn validate_meeting_id(meeting_id: &str) -> Result<()> {

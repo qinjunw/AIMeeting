@@ -5,7 +5,7 @@ pub mod recovery;
 
 pub use database::{
     MeetingMinutesRow, MeetingRecordRow, MeetingRepository, NewMeetingRecord, NewProcessingJob,
-    ProcessingJobRow,
+    ProcessingJobRow, RecordingAssetRow,
 };
 pub use files::DataPaths;
 

@@ -1,11 +1,13 @@
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::time::{Duration, Instant};
 
+use serde::Serialize;
 use thiserror::Error;
 
 use super::frame::{AudioFrame, AudioSource};
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CaptureSourceKind {
     Microphone,
     System,
@@ -20,14 +22,16 @@ impl CaptureSourceKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum NativeSampleFormat {
     F32,
     I16,
     U16,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AudioDeviceInfo {
     pub id: String,
     pub name: String,

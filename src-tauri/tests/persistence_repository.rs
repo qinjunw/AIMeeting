@@ -77,6 +77,60 @@ fn meeting_processing_states_are_updated_together() {
 }
 
 #[test]
+fn recording_lifecycle_metadata_is_persisted_with_the_local_asset() {
+    let (_directory, repository) = test_repository();
+    repository
+        .create_meeting(&NewMeetingRecord::for_test("meeting-recording", "录音测试"))
+        .unwrap();
+
+    repository
+        .create_recording_run(
+            "meeting-recording-run-1",
+            "meeting-recording",
+            1,
+            1,
+            r#"{"microphone":true,"system":true}"#,
+            "2026-08-19T00:00:00Z",
+        )
+        .unwrap();
+    repository
+        .finish_recording_run("meeting-recording-run-1", "2026-08-19T00:01:00Z")
+        .unwrap();
+    repository
+        .upsert_recording_asset(
+            "meeting-recording",
+            "recording.opus",
+            "ready",
+            60_000,
+            42_000,
+            "2026-08-19T00:00:00Z",
+        )
+        .unwrap();
+    repository
+        .mark_meeting_stopped(
+            "meeting-recording",
+            "ready",
+            "pending",
+            "pending",
+            "2026-08-19T00:01:00Z",
+        )
+        .unwrap();
+
+    let meeting = repository
+        .get_meeting("meeting-recording")
+        .unwrap()
+        .expect("meeting");
+    assert_eq!(meeting.status, "ready");
+    assert_eq!(meeting.stopped_at.as_deref(), Some("2026-08-19T00:01:00Z"));
+    let asset = repository
+        .latest_recording_asset("meeting-recording")
+        .unwrap()
+        .expect("recording asset");
+    assert_eq!(asset.duration_ms, 60_000);
+    assert_eq!(asset.byte_size, 42_000);
+}
+
+#[test]
 fn transcript_revisions_are_append_only() {
     let (_temp, repository) = test_repository();
     repository
@@ -94,6 +148,37 @@ fn transcript_revisions_are_append_only() {
     assert_eq!(
         repository.transcript_for_revision("meeting-1", 1).unwrap(),
         "第一段\n第二段"
+    );
+    assert_eq!(
+        repository.full_transcript("meeting-1").unwrap(),
+        "第一段\n第二段"
+    );
+}
+
+#[test]
+fn startup_recovery_marks_incomplete_meetings_interrupted() {
+    let (_temp, repository) = test_repository();
+    repository
+        .create_meeting(&NewMeetingRecord::for_test("meeting-1", "未完成会议"))
+        .unwrap();
+    repository
+        .update_meeting_states(
+            "meeting-1",
+            "recording",
+            "streaming",
+            "pending",
+            "2026-08-19T12:00:00Z",
+        )
+        .unwrap();
+
+    let recovered = repository
+        .recover_incomplete_meetings("2026-08-19T12:01:00Z")
+        .unwrap();
+
+    assert_eq!(recovered, ["meeting-1"]);
+    assert_eq!(
+        repository.get_meeting("meeting-1").unwrap().unwrap().status,
+        "interrupted"
     );
 }
 
@@ -212,4 +297,18 @@ fn trash_move_and_restore_preserve_recording_files() {
         std::fs::read(meeting_dir.join("recording.ogg")).unwrap(),
         b"recording-data"
     );
+}
+
+#[test]
+fn permanent_trash_cleanup_removes_the_recording_directory() {
+    let temp = TempDir::new().expect("temporary directory");
+    let paths = DataPaths::new(temp.path()).expect("data paths");
+    let meeting_dir = paths.meeting_dir("meeting-1").expect("meeting directory");
+    std::fs::create_dir_all(&meeting_dir).unwrap();
+    std::fs::write(meeting_dir.join("recording.opus"), b"recording-data").unwrap();
+    paths.move_to_trash("meeting-1").unwrap();
+
+    paths.permanently_delete_from_trash("meeting-1").unwrap();
+
+    assert!(!paths.trash_dir("meeting-1").unwrap().exists());
 }

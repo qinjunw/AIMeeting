@@ -1,3 +1,15 @@
+mod meetings;
+mod recording;
+
+pub(crate) use meetings::{
+    get_meeting, get_meeting_detail, list_meetings, list_trash, permanently_delete_meetings,
+    rename_meeting, restore_meetings, trash_meetings,
+};
+pub(crate) use recording::{
+    get_active_meeting, list_audio_devices, pause_recording, resume_recording, start_recording,
+    stop_recording,
+};
+
 use crate::gateways::{
     file_asr::openai_compatible::{self, TranscribeAudioRequest, TranscribeAudioResponse},
     live_asr::dashscope::{

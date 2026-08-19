@@ -14,6 +14,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 base64 = "0.22.1"
+chrono = { version = "0.4.42", default-features = false, features = ["clock"] }
 cpal = "=0.18.2"
 futures-util = "0.3"
 ogg = "0.9.2"

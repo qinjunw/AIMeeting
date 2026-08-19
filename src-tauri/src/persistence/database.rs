@@ -1,10 +1,12 @@
 use std::path::Path;
 
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::Serialize;
 
 use super::{migrations, Result};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MeetingRecordRow {
     pub id: String,
     pub title: String,
@@ -27,7 +29,8 @@ pub struct NewMeetingRecord {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MeetingMinutesRow {
     pub id: String,
     pub meeting_id: String,
@@ -35,6 +38,16 @@ pub struct MeetingMinutesRow {
     pub content: String,
     pub provider_label: String,
     pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingAssetRow {
+    pub relative_path: String,
+    pub format: String,
+    pub status: String,
+    pub duration_ms: i64,
+    pub byte_size: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -180,6 +193,172 @@ impl MeetingRepository {
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+
+    pub fn get_meeting(&self, meeting_id: &str) -> Result<Option<MeetingRecordRow>> {
+        self.connection
+            .query_row(
+                "SELECT id, title, status, transcription_status, minutes_status,
+                        created_at, updated_at, stopped_at, deleted_at
+                 FROM meeting_records WHERE id = ?1",
+                params![meeting_id],
+                map_meeting_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn rename_meeting(&self, meeting_id: &str, title: &str, updated_at: &str) -> Result<()> {
+        self.connection.execute(
+            "UPDATE meeting_records SET title = ?2, updated_at = ?3 WHERE id = ?1",
+            params![meeting_id, title, updated_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn latest_recording_asset(&self, meeting_id: &str) -> Result<Option<RecordingAssetRow>> {
+        self.connection
+            .query_row(
+                "SELECT relative_path, format, status, duration_ms, byte_size
+                 FROM recording_assets WHERE meeting_id = ?1 ORDER BY created_at DESC LIMIT 1",
+                params![meeting_id],
+                |row| {
+                    Ok(RecordingAssetRow {
+                        relative_path: row.get(0)?,
+                        format: row.get(1)?,
+                        status: row.get(2)?,
+                        duration_ms: row.get(3)?,
+                        byte_size: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn full_transcript(&self, meeting_id: &str) -> Result<String> {
+        let mut statement = self.connection.prepare(
+            "SELECT text FROM transcript_segments
+             WHERE meeting_id = ?1 AND status = 'final'
+             ORDER BY start_ms, revision, id",
+        )?;
+        let rows = statement.query_map(params![meeting_id], |row| row.get::<_, String>(0))?;
+        let parts = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(parts.join("\n"))
+    }
+
+    pub fn recover_incomplete_meetings(&self, updated_at: &str) -> Result<Vec<String>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id FROM meeting_records
+             WHERE deleted_at IS NULL AND status IN ('preparing', 'recording', 'stopping', 'processing')",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let ids = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+        for meeting_id in &ids {
+            self.connection.execute(
+                "UPDATE meeting_records SET status = 'interrupted', updated_at = ?2 WHERE id = ?1",
+                params![meeting_id, updated_at],
+            )?;
+            self.connection.execute(
+                "UPDATE recording_runs SET status = 'interrupted', ended_at = COALESCE(ended_at, ?2)
+                 WHERE meeting_id = ?1 AND status = 'recording'",
+                params![meeting_id, updated_at],
+            )?;
+        }
+        Ok(ids)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_recording_run(
+        &self,
+        run_id: &str,
+        meeting_id: &str,
+        sequence_number: i64,
+        generation: i64,
+        sources_json: &str,
+        started_at: &str,
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO recording_runs (
+                id, meeting_id, sequence_number, generation, status, sources_json, started_at
+             ) VALUES (?1, ?2, ?3, ?4, 'recording', ?5, ?6)",
+            params![
+                run_id,
+                meeting_id,
+                sequence_number,
+                generation,
+                sources_json,
+                started_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn finish_recording_run(&self, run_id: &str, ended_at: &str) -> Result<()> {
+        self.connection.execute(
+            "UPDATE recording_runs SET status = 'ready', ended_at = ?2 WHERE id = ?1",
+            params![run_id, ended_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_recording_asset(
+        &self,
+        meeting_id: &str,
+        relative_path: &str,
+        status: &str,
+        duration_ms: i64,
+        byte_size: i64,
+        created_at: &str,
+    ) -> Result<()> {
+        let asset_id = format!("{meeting_id}-recording");
+        self.connection.execute(
+            "INSERT INTO recording_assets (
+                id, meeting_id, relative_path, format, status, duration_ms, byte_size, created_at
+             ) VALUES (?1, ?2, ?3, 'ogg_opus', ?4, ?5, ?6, ?7)
+             ON CONFLICT(id) DO UPDATE SET
+                status = excluded.status,
+                duration_ms = excluded.duration_ms,
+                byte_size = excluded.byte_size",
+            params![
+                asset_id,
+                meeting_id,
+                relative_path,
+                status,
+                duration_ms,
+                byte_size,
+                created_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_meeting_stopped(
+        &self,
+        meeting_id: &str,
+        status: &str,
+        transcription_status: &str,
+        minutes_status: &str,
+        stopped_at: &str,
+    ) -> Result<()> {
+        self.connection.execute(
+            "UPDATE meeting_records SET
+                status = ?2,
+                transcription_status = ?3,
+                minutes_status = ?4,
+                stopped_at = ?5,
+                updated_at = ?5
+             WHERE id = ?1",
+            params![
+                meeting_id,
+                status,
+                transcription_status,
+                minutes_status,
+                stopped_at
+            ],
+        )?;
+        Ok(())
     }
 
     pub fn soft_delete_meeting(&self, meeting_id: &str, deleted_at: &str) -> Result<()> {
@@ -342,4 +521,18 @@ impl MeetingRepository {
             .optional()
             .map_err(Into::into)
     }
+}
+
+fn map_meeting_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MeetingRecordRow> {
+    Ok(MeetingRecordRow {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        status: row.get(2)?,
+        transcription_status: row.get(3)?,
+        minutes_status: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+        stopped_at: row.get(7)?,
+        deleted_at: row.get(8)?,
+    })
 }
