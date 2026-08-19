@@ -130,6 +130,7 @@ type WireMeetingMinutes = {
 
 type WireMeetingDetail = {
   meeting: WireMeetingRecord
+  transcriptRevision: number
   transcript: string
   minutes: WireMeetingMinutes | null
   recording: MeetingAudioAsset | null
@@ -154,7 +155,7 @@ function mapMeetingDetails(detail: WireMeetingDetail): MeetingDetails {
   return {
     ...summary,
     durationMs: detail.recording?.durationMs ?? 0,
-    transcriptRevision: detail.minutes?.revision ?? 0,
+    transcriptRevision: detail.transcriptRevision,
     transcript: detail.transcript,
     minutes: detail.minutes
       ? {

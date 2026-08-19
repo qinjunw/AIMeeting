@@ -28,6 +28,7 @@ pub(crate) struct MeetingIdsRequest {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MeetingDetail {
     meeting: MeetingRecordRow,
+    transcript_revision: i64,
     transcript: String,
     minutes: Option<MeetingMinutesRow>,
     recording: Option<RecordingAssetRow>,
@@ -71,6 +72,9 @@ pub(crate) fn get_meeting_detail(
         return Ok(None);
     };
     Ok(Some(MeetingDetail {
+        transcript_revision: repository
+            .latest_transcript_revision(&request.meeting_id)
+            .map_err(|error| error.to_string())?,
         transcript: repository
             .full_transcript(&request.meeting_id)
             .map_err(|error| error.to_string())?,

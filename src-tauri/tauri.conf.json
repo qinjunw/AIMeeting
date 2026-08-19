@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "AIMeeting Copilot",
+        "title": "AIMeeting",
         "width": 1440,
         "height": 920,
         "minWidth": 1100,

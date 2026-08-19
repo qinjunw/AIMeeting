@@ -31,7 +31,13 @@ describe('desktop bridge clients', () => {
     invoke.mockImplementation(async (command: string) => {
       if (command === 'list_meetings') return [meeting]
       if (command === 'get_meeting_detail') {
-        return { meeting, transcript: '评审通过。', minutes: null, recording: null }
+        return {
+          meeting,
+          transcriptRevision: 1,
+          transcript: '评审通过。',
+          minutes: null,
+          recording: null,
+        }
       }
       return undefined
     })
