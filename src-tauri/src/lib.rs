@@ -1,5 +1,8 @@
 mod commands;
+pub mod domain;
 mod gateways;
+pub mod meeting;
+pub mod persistence;
 
 use commands::{
     cancel_streaming_asr_session, capture_capabilities, finish_streaming_asr_session,
