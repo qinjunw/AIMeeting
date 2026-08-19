@@ -1,3 +1,4 @@
+pub mod audio;
 mod commands;
 pub mod domain;
 pub mod gateways;
