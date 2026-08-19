@@ -1,6 +1,6 @@
 mod commands;
 pub mod domain;
-mod gateways;
+pub mod gateways;
 pub mod meeting;
 pub mod persistence;
 
