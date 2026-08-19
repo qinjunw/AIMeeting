@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted
+Superseded by the native recording and persistent processing design in `0.2.0`.
+
+This ADR is retained as historical context for the earlier wake-assistant prototype. The production UI no longer includes wake capture or Copilot behavior.
 
 ## Context
 

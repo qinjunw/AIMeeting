@@ -23,6 +23,8 @@ if /I "%ACTION%"=="check" goto :check
 if /I "%ACTION%"=="format" goto :format
 if /I "%ACTION%"=="clippy" goto :clippy
 if /I "%ACTION%"=="release" goto :release
+if /I "%ACTION%"=="portable" goto :portable
+if /I "%ACTION%"=="verify-portable" goto :verify_portable
 
 echo [AIMeeting] Unknown command: %ACTION%
 echo.
@@ -70,13 +72,19 @@ exit /b %ERRORLEVEL%
 
 :release
 echo [AIMeeting] Building Windows installers...
-call npm.cmd run lint
-if errorlevel 1 exit /b %ERRORLEVEL%
-call npm.cmd run build
-if errorlevel 1 exit /b %ERRORLEVEL%
-call npm.cmd run test
+call npm.cmd run check
 if errorlevel 1 exit /b %ERRORLEVEL%
 call npm.cmd run desktop:build -- --bundles nsis,msi
+exit /b %ERRORLEVEL%
+
+:portable
+echo [AIMeeting] Building and verifying Windows no-install package...
+pwsh -NoProfile -File "%~dp0scripts\build-portable.ps1"
+exit /b %ERRORLEVEL%
+
+:verify_portable
+echo [AIMeeting] Verifying latest Windows no-install package...
+pwsh -NoProfile -File "%~dp0scripts\verify-portable.ps1"
 exit /b %ERRORLEVEL%
 
 :help
@@ -93,6 +101,8 @@ echo   aimeeting.cmd check        Run tests, types, formatting, and Clippy
 echo   aimeeting.cmd format       Check Rust formatting
 echo   aimeeting.cmd clippy       Run Rust Clippy with warnings denied
 echo   aimeeting.cmd release      Build unsigned Windows installers
+echo   aimeeting.cmd portable     Build and verify a Windows no-install ZIP
+echo   aimeeting.cmd verify-portable  Verify the latest no-install ZIP
 echo.
 echo Notes:
 echo   Use dev for normal local testing. The web command does not start Tauri backend commands.
