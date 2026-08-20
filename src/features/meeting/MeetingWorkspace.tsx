@@ -1,6 +1,9 @@
-import { FileText, RotateCcw, ScrollText } from 'lucide-react'
+import { convertFileSrc } from '@tauri-apps/api/core'
+import { FileText, Play, RotateCcw, ScrollText } from 'lucide-react'
+import { useEffect, useState } from 'react'
 
 import type { MeetingDetails } from '../../bridge/meetingRepositoryClient'
+import { Modal } from '../../components/Modal'
 import type { RecordingStatus } from '../../domain/meeting'
 import type { MinutesViewState, TranscriptionViewState } from './useMeetingSession'
 
@@ -29,6 +32,8 @@ export function MeetingWorkspace({
   onRetryTranscription,
   onRetryMinutes,
 }: MeetingWorkspaceProps) {
+  const [audioOpen, setAudioOpen] = useState(false)
+  const [audioError, setAudioError] = useState<string | null>(null)
   const isActiveMeeting = activeMeetingId !== null && activeMeetingId === meeting?.id
   const liveTranscript = [
     ...transcription.segments.map((segment) => segment.text),
@@ -41,6 +46,14 @@ export function MeetingWorkspace({
   const recordingStatus = isActiveMeeting && activeRecordingStatus !== 'idle'
     ? activeRecordingStatus
     : meeting?.recordingStatus
+  const recordingIsOpen = ['preparing', 'recording', 'paused', 'stopping'].includes(recordingStatus ?? '')
+    || ['preparing', 'recording', 'paused', 'stopping'].includes(meeting?.audio?.status ?? '')
+  const canPlayRecording = Boolean(meeting?.audio?.playbackPath) && !recordingIsOpen
+
+  useEffect(() => {
+    setAudioOpen(false)
+    setAudioError(null)
+  }, [meeting?.id])
 
   return (
     <main className="meeting-workspace">
@@ -49,7 +62,21 @@ export function MeetingWorkspace({
           <span className="workspace-eyebrow">{meeting ? formatDate(meeting.createdAt) : '新会议'}</span>
           <h1>{meeting?.title ?? '准备开始一场会议'}</h1>
         </div>
-        {meeting && recordingStatus && <span className={`meeting-status meeting-status--${recordingStatus}`}>{recordingLabel(recordingStatus)}</span>}
+        <div className="workspace-header-actions">
+          {canPlayRecording && (
+            <button
+              className="secondary-button playback-trigger"
+              type="button"
+              onClick={() => {
+                setAudioError(null)
+                setAudioOpen(true)
+              }}
+            >
+              <Play aria-hidden="true" />播放录音
+            </button>
+          )}
+          {meeting && recordingStatus && <span className={`meeting-status meeting-status--${recordingStatus}`}>{recordingLabel(recordingStatus)}</span>}
+        </div>
       </header>
 
       {(transcription.error || minutes.error) && isActiveMeeting && (
@@ -89,6 +116,24 @@ export function MeetingWorkspace({
           />
         )}
       </section>
+
+      {audioOpen && meeting?.audio?.playbackPath && (
+        <Modal title="会议录音" onClose={() => setAudioOpen(false)}>
+          <div className="recording-player">
+            <p className="recording-player-meta">
+              {formatPlaybackDuration(meeting.audio.durationMs)} · {formatFileSize(meeting.audio.byteSize)}
+            </p>
+            <audio
+              aria-label="会议录音播放器"
+              controls
+              preload="metadata"
+              src={convertFileSrc(meeting.audio.playbackPath)}
+              onError={() => setAudioError('录音文件暂时无法播放。')}
+            />
+            {audioError && <p className="recording-player-error" role="alert">{audioError}</p>}
+          </div>
+        </Modal>
+      )}
     </main>
   )
 }
@@ -103,6 +148,19 @@ function formatDate(value: string) {
   return new Intl.DateTimeFormat('zh-CN', {
     year: 'numeric', month: 'long', day: 'numeric', weekday: 'short',
   }).format(date)
+}
+
+function formatPlaybackDuration(durationMs: number) {
+  const totalSeconds = Math.max(0, Math.floor(durationMs / 1000))
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  return `${minutes}:${seconds.toString().padStart(2, '0')}`
+}
+
+function formatFileSize(byteSize: number) {
+  if (byteSize >= 1024 * 1024) return `${(byteSize / (1024 * 1024)).toFixed(1)} MB`
+  if (byteSize >= 1024) return `${Math.round(byteSize / 1024)} KB`
+  return `${Math.max(0, byteSize)} B`
 }
 
 function recordingLabel(status: MeetingDetails['recordingStatus']) {

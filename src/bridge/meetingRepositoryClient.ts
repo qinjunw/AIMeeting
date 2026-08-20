@@ -25,6 +25,7 @@ export type MeetingMinutes = {
 
 export type MeetingAudioAsset = {
   relativePath: string
+  playbackPath: string | null
   format: string
   status: string
   durationMs: number
@@ -148,12 +149,15 @@ type WireMeetingMinutes = {
   providerLabel: string
 }
 
+type WireRecordingAsset = Omit<MeetingAudioAsset, 'playbackPath'>
+
 type WireMeetingDetail = {
   meeting: WireMeetingRecord
   transcriptRevision: number
   transcript: string
   minutes: WireMeetingMinutes | null
-  recording: MeetingAudioAsset | null
+  recording: WireRecordingAsset | null
+  recordingPlaybackPath: string | null
 }
 
 function mapMeetingSummary(row: WireMeetingRecord): MeetingSummary {
@@ -184,6 +188,8 @@ function mapMeetingDetails(detail: WireMeetingDetail): MeetingDetails {
           providerLabel: detail.minutes.providerLabel,
         }
       : null,
-    audio: detail.recording,
+    audio: detail.recording
+      ? { ...detail.recording, playbackPath: detail.recordingPlaybackPath }
+      : null,
   }
 }

@@ -33,6 +33,7 @@ const details: MeetingDetails = {
   },
   audio: {
     relativePath: 'meetings/meeting-1/recording.ogg',
+    playbackPath: 'C:\\recording.opus',
     format: 'ogg_opus',
     status: 'ready',
     durationMs: 3_600_000,

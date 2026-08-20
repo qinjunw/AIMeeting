@@ -36,7 +36,14 @@ describe('desktop bridge clients', () => {
           transcriptRevision: 1,
           transcript: '评审通过。',
           minutes: null,
-          recording: null,
+          recording: {
+            relativePath: 'recording.opus',
+            format: 'ogg_opus',
+            status: 'ready',
+            durationMs: 15_000,
+            byteSize: 62_000,
+          },
+          recordingPlaybackPath: 'C:\\recording.opus',
         }
       }
       return undefined
@@ -44,10 +51,12 @@ describe('desktop bridge clients', () => {
     const client = createMeetingRepositoryClient(transport)
 
     await client.list({ deleted: false, limit: 50 })
-    await client.get('meeting-1')
+    const detail = await client.get('meeting-1')
     await client.moveToTrash('meeting-1')
     await client.restore('meeting-1')
     await client.permanentlyDelete('meeting-1')
+
+    expect(detail.audio?.playbackPath).toBe('C:\\recording.opus')
 
     expect(invoke.mock.calls).toEqual([
       ['list_meetings'],
