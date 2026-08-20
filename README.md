@@ -50,14 +50,23 @@ npm.cmd install
 
 `dev` 同时管理 Vite 和 Tauri；关闭该命令后 5173 端口会释放。`web` 只启动前端，不能执行录音、SQLite、凭据等 Tauri 命令。
 
+双击 `aimeeting.cmd` 或无参数运行时会打开已构建的生产版，不启动 Vite，也不会保留开发控制台。首次尚无生产 EXE 时会自动构建一次；源码更新后可显式刷新：
+
+```powershell
+.\aimeeting.cmd build-app
+.\aimeeting.cmd
+```
+
 常用入口：
 
 ```powershell
+.\aimeeting.cmd build-app
 .\aimeeting.cmd check
 .\aimeeting.cmd portable
 .\aimeeting.cmd release
 ```
 
+- `build-app`：构建内嵌前端资源的生产 EXE，供根脚本无参数启动。
 - `check`：前端测试、TypeScript、Rust 测试、格式和 Clippy。
 - `portable`：构建并校验 Windows x64 免安装 ZIP 和 SHA-256。
 - `release`：构建未签名的 NSIS/MSI 安装包。
