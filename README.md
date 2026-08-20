@@ -1,82 +1,75 @@
 # AIMeeting
 
-AIMeeting 是一个 Windows 优先的本地会议录音、实时转写和会议纪要桌面应用。`0.2.0` 是供受控测试的免安装发布候选。
+AIMeeting 是一个 Windows 桌面会议工具，支持本地录音、实时转写和简体中文会议纪要。当前版本为 `0.2.0` Windows x64 测试候选版。
 
-## 当前能力
+## 当前功能
 
-- 麦克风与 Windows 系统声音可独立开关，默认双路混音。
-- 录音持续保存为 Ogg Opus；实时转写失败不会停止或丢弃录音。
-- 支持开始、暂停、恢复、结束，以及异常退出后的未完成会议恢复。
-- DashScope Paraformer 提供低延迟实时字幕。
-- 保存后的录音可通过文件 ASR 重新转写。
-- 文字模型将转写整理为简体中文会议纪要。
-- SQLite 保存会议、转写版本和处理任务；会议历史支持回收站与永久删除。
-- API Key 进入 Windows Credential Manager，不写入浏览器存储或 SQLite。
+- 麦克风和 Windows 系统声音独立开关，默认混音录制。
+- 录音持久化为 Ogg Opus，转写失败不影响录音。
+- 支持开始、暂停、恢复、结束和异常退出恢复。
+- DashScope Paraformer 实时转写。
+- 保存后的录音可重新转写并重新生成纪要。
+- SQLite 保存会议、转写和处理状态。
+- 支持录音播放、会议历史、回收站和永久删除。
+- API Key 保存到 Windows Credential Manager。
 
+暂未实现 Android 客户端、说话人分离、远端会议房间和本地 ASR。
 
-## 使用免安装版
+## 运行
 
-解压 `AIMeeting-0.2.0-windows-x64-no-install.zip` 后运行 `AIMeeting.exe`。完整说明见 [Windows 快速开始](docs/quickstart-windows.md)。
+免安装版解压后运行 `AIMeeting.exe`。Windows 10/11 x64 需要 Microsoft Edge WebView2 Runtime。使用说明见 [Windows 快速开始](docs/quickstart-windows.md)。
 
-会议数据位于：
-
-```text
-%LOCALAPPDATA%\com.aimeeting.app
-```
-
-删除 EXE 不会删除会议数据或 Credential Manager 中的 Provider 密钥。Windows 10/11 x64 还需要 Microsoft Edge WebView2 Runtime，系统通常已预装。
-
-## Provider 配置
-
-设置中有三个相互独立的能力：
-
-| 能力 | 当前支持 |
-| --- | --- |
-| 实时语音转文字 | DashScope `paraformer-realtime-v2` |
-| 录音文件转写 | OpenAI-compatible `/audio/transcriptions` 或兼容的 Qwen ASR |
-| 会议纪要 | OpenAI-compatible Chat Completions 或 Responses 文字模型 |
-
-远程地址必须使用 HTTPS。本机 `localhost`、`127.0.0.1` 和 `::1` 可以使用 HTTP。
-
-## 源码开发
-
-需要 Node.js、Rust stable、MSVC C++ Build Tools、Windows SDK 和 WebView2 Runtime：
+源码开发需要 Node.js、Rust stable、MSVC C++ Build Tools、Windows SDK 和 WebView2 Runtime：
 
 ```powershell
 npm.cmd install
 .\aimeeting.cmd dev
 ```
 
-`dev` 同时管理 Vite 和 Tauri；关闭该命令后 5173 端口会释放。`web` 只启动前端，不能执行录音、SQLite、凭据等 Tauri 命令。
-
-双击 `aimeeting.cmd` 或无参数运行时会打开已构建的生产版，不启动 Vite，也不会保留开发控制台。首次尚无生产 EXE 时会自动构建一次；源码更新后可显式刷新：
+构建并启动生产版：
 
 ```powershell
 .\aimeeting.cmd build-app
 .\aimeeting.cmd
 ```
 
-常用入口：
+完整检查与发布构建：
 
 ```powershell
-.\aimeeting.cmd build-app
 .\aimeeting.cmd check
 .\aimeeting.cmd portable
 .\aimeeting.cmd release
 ```
 
-- `build-app`：构建内嵌前端资源的生产 EXE，供根脚本无参数启动。
-- `check`：前端测试、TypeScript、Rust 测试、格式和 Clippy。
-- `portable`：构建并校验 Windows x64 免安装 ZIP 和 SHA-256。
-- `release`：构建未签名的 NSIS/MSI 安装包。
+`portable` 生成免安装 ZIP，`release` 生成未签名的 NSIS/MSI 安装包。发布说明见 [Windows 发布](docs/release-windows.md)。
 
-## 结构
+## Provider
 
-- `src/`：React 桌面界面、类型化 Tauri bridge 和状态层。
-- `src-tauri/src/audio/`：采集、重采样、混音、队列和 Opus 写盘。
-- `src-tauri/src/domain/`：会议、任务和 Provider 领域状态。
-- `src-tauri/src/gateways/`：实时 ASR、文件 ASR、纪要和 Room Gateway。
-- `src-tauri/src/persistence/`：SQLite、文件布局、恢复和凭据存储。
-- `src-tauri/src/runtime/`：录音线程、实时转写桥与后台任务恢复。
+| 能力 | 支持方式 |
+| --- | --- |
+| 实时转写 | DashScope `paraformer-realtime-v2` |
+| 录音文件转写 | OpenAI-compatible `/audio/transcriptions` 或兼容的 Qwen ASR |
+| 会议纪要 | OpenAI-compatible Chat Completions 或 Responses 文字模型 |
 
-发布限制和验证证据见 [0.2.0 发布就绪记录](docs/release-readiness-0.2.0.md)。
+远程 Provider 必须使用 HTTPS；本机回环地址允许使用 HTTP。
+
+## 本地数据
+
+会议、录音、转写和纪要默认保存在：
+
+```text
+%LOCALAPPDATA%\com.aimeeting.app
+```
+
+删除程序不会自动删除会议数据或 Provider 密钥。云端处理范围和删除规则见 [隐私说明](docs/privacy.md)。
+
+## 代码结构
+
+- `src/`：React 桌面界面、状态和 Tauri bridge。
+- `src-tauri/src/audio/`：采集、混音、重采样和 Opus 写盘。
+- `src-tauri/src/domain/`：会议、任务和 Provider 状态。
+- `src-tauri/src/gateways/`：实时 ASR、文件 ASR、纪要和 Room Gateway 接口。
+- `src-tauri/src/persistence/`：SQLite、文件、恢复和凭据。
+- `src-tauri/src/runtime/`：录音线程、实时转写和后台任务。
+
+验证状态见 [0.2.0 发布就绪记录](docs/release-readiness-0.2.0.md)。
