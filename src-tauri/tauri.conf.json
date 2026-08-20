@@ -13,11 +13,13 @@
     "windows": [
       {
         "title": "AIMeeting",
-        "width": 1440,
-        "height": 920,
-        "minWidth": 1100,
-        "minHeight": 740,
-        "resizable": true
+        "width": 1200,
+        "height": 720,
+        "minWidth": 760,
+        "minHeight": 500,
+        "center": true,
+        "resizable": true,
+        "visible": false
       }
     ],
     "security": {
