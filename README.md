@@ -1,6 +1,9 @@
 # AIMeeting
 
-AIMeeting 是一个 Windows 桌面会议工具，支持本地录音、实时转写和简体中文会议纪要。当前版本为 `0.2.0` Windows x64 测试候选版。
+AIMeeting 是一个 Windows 桌面会议工具，支持本地录音、实时转写和简体中文会议纪要。
+
+<img width="2638" height="1574" alt="image" src="https://github.com/user-attachments/assets/00a45e6e-5e21-4413-b49f-9ec4427686ab" />
+
 
 ## 当前功能
 
@@ -13,7 +16,6 @@ AIMeeting 是一个 Windows 桌面会议工具，支持本地录音、实时转�
 - 支持录音播放、会议历史、回收站和永久删除。
 - API Key 保存到 Windows Credential Manager。
 
-暂未实现 Android 客户端、说话人分离、远端会议房间和本地 ASR。
 
 ## 运行
 
