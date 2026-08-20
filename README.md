@@ -13,7 +13,6 @@ AIMeeting 是一个 Windows 优先的本地会议录音、实时转写和会议�
 - SQLite 保存会议、转写版本和处理任务；会议历史支持回收站与永久删除。
 - API Key 进入 Windows Credential Manager，不写入浏览器存储或 SQLite。
 
-远端多人房间只保留 `RoomGateway` 接口；Android、说话人分离、本地 ASR 和助手唤醒不在当前版本中。
 
 ## 使用免安装版
 
